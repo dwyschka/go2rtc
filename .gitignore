@@ -12,6 +12,11 @@ go2rtc_win*
 /go2rtc
 /go2rtc.exe
 
+# petkit on-device build artifacts
+/dist/
+/go2rtc-armhf
+/go2rtc-petkit-*
+
 0_test.go
 
 .DS_Store
