@@ -21,17 +21,26 @@ func TalkbackDiag() []string {
 	defer mb.Close()
 	r = append(r, fmt.Sprintf("shm /media_buffer_frame_buf: OK (ring %d bytes)", mb.ringSize))
 
-	diag := func(label string, dst, msg uint16, payload []byte) {
-		if err := dispatchSend(dst, msg, payload); err != nil {
-			r = append(r, fmt.Sprintf("%s: FAIL — %v", label, err))
+	// List the POSIX mqueue filesystem, if mounted, so we can see the queues
+	// and their permissions.
+	if entries, err := os.ReadDir("/dev/mqueue"); err != nil {
+		r = append(r, "/dev/mqueue: not listable — "+err.Error())
+	} else {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		r = append(r, fmt.Sprintf("/dev/mqueue: %v", names))
+	}
+
+	for _, name := range []string{"/msg_dispatch_2", "/msg_dispatch_10", "/msg_dispatch_13"} {
+		errno := mqProbe(name)
+		if errno == 0 {
+			r = append(r, name+": OPEN OK")
 		} else {
-			r = append(r, label+": OK")
+			r = append(r, fmt.Sprintf("%s: errno=%d (%v)", name, int(errno), errno))
 		}
 	}
-	diag("speaker_enable /msg_dispatch_2 msg18", 2, 18, []byte{1, 0, 0, 0})
-	diag("speak_start   /msg_dispatch_2 msg5", 2, 5, nil)
-	diag("ping          /msg_dispatch_10 msg1", 10, 1, nil)
-	diag("ping          /msg_dispatch_13 msg1", 13, 1, []byte{0, 0, 0, 0})
 	return r
 }
 

@@ -78,13 +78,12 @@ func mqOpen(name string) (uintptr, error) {
 	}
 	namePtr := uintptr(unsafe.Pointer(np))
 
-	// The camera pipeline already created "/msg_dispatch_1"; open the existing
-	// queue first (no O_CREAT, no attr). This sidesteps the kernel's create-time
-	// mqueue limits (fs.mqueue.msg_max / msgsize_max) and mode checks that can
-	// reject an O_CREAT open even for root.
+	// Open the existing queue first (no O_CREAT), exactly like libbase's
+	// open_mqueue: O_RDWR|O_NONBLOCK (flag 0x802). This sidesteps create-time
+	// mqueue limits and mode checks.
 	mqd, _, errno := unix.Syscall6(
 		unix.SYS_MQ_OPEN, namePtr,
-		uintptr(unix.O_WRONLY|unix.O_NONBLOCK), 0, 0, 0, 0,
+		uintptr(unix.O_RDWR|unix.O_NONBLOCK), 0, 0, 0, 0,
 	)
 	if errno == 0 {
 		return mqd, nil
@@ -99,13 +98,30 @@ func mqOpen(name string) (uintptr, error) {
 	attr := [8]int{0, mqMaxMsg, mqMsgSize, 0, 0, 0, 0, 0}
 	mqd, _, errno = unix.Syscall6(
 		unix.SYS_MQ_OPEN, namePtr,
-		uintptr(unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CREAT), 0777,
+		uintptr(unix.O_RDWR|unix.O_NONBLOCK|unix.O_CREAT), 0777,
 		uintptr(unsafe.Pointer(&attr)), 0, 0,
 	)
 	if errno != 0 {
 		return 0, errno
 	}
 	return mqd, nil
+}
+
+// mqProbe attempts to open an existing queue (no create) for diagnostics and
+// returns the raw errno (0 = success).
+func mqProbe(name string) unix.Errno {
+	np, err := unix.BytePtrFromString(name)
+	if err != nil {
+		return unix.EINVAL
+	}
+	mqd, _, errno := unix.Syscall6(
+		unix.SYS_MQ_OPEN, uintptr(unsafe.Pointer(np)),
+		uintptr(unix.O_RDWR|unix.O_NONBLOCK), 0, 0, 0, 0,
+	)
+	if errno == 0 {
+		unix.Close(int(mqd))
+	}
+	return errno
 }
 
 // mqSend delivers one message at priority 0 (mq_timedsend with a NULL timeout;
