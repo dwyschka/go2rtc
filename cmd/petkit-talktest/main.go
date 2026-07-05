@@ -31,6 +31,12 @@ func main() {
 		}
 	}
 
+	fmt.Println("=== talkback diagnostics ===")
+	for _, line := range petkit.TalkbackDiag() {
+		fmt.Println("  " + line)
+	}
+	fmt.Println("============================")
+
 	fmt.Printf("playing %.0f Hz tone for %.1fs on the camera speaker...\n", freq, secs)
 	if err := petkit.SelfTestTone(time.Duration(secs*float64(time.Second)), freq); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)

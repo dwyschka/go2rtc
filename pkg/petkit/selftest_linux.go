@@ -1,9 +1,39 @@
 package petkit
 
 import (
+	"fmt"
 	"math"
+	"os"
 	"time"
 )
+
+// TalkbackDiag probes the pieces the talkback path needs and returns a
+// human-readable report: privilege level, shared-memory access, and whether
+// each dispatch mqueue can be written. Use it to pinpoint why no sound plays.
+func TalkbackDiag() []string {
+	var r []string
+	r = append(r, fmt.Sprintf("euid=%d (root=%v)", os.Geteuid(), os.Geteuid() == 0))
+
+	mb, err := OpenMBuffer()
+	if err != nil {
+		return append(r, "shm /media_buffer_frame_buf: FAIL — "+err.Error())
+	}
+	defer mb.Close()
+	r = append(r, fmt.Sprintf("shm /media_buffer_frame_buf: OK (ring %d bytes)", mb.ringSize))
+
+	diag := func(label string, dst, msg uint16, payload []byte) {
+		if err := dispatchSend(dst, msg, payload); err != nil {
+			r = append(r, fmt.Sprintf("%s: FAIL — %v", label, err))
+		} else {
+			r = append(r, label+": OK")
+		}
+	}
+	diag("speaker_enable /msg_dispatch_2 msg18", 2, 18, []byte{1, 0, 0, 0})
+	diag("speak_start   /msg_dispatch_2 msg5", 2, 5, nil)
+	diag("ping          /msg_dispatch_10 msg1", 10, 1, nil)
+	diag("ping          /msg_dispatch_13 msg1", 13, 1, []byte{0, 0, 0, 0})
+	return r
+}
 
 // SelfTestTone plays a sine tone on the camera speaker for the given duration
 // via the talkback path (speak_start + mbuffer write + media daemon decode).
@@ -22,9 +52,9 @@ func SelfTestTone(dur time.Duration, freqHz float64) error {
 	}
 	defer mb.Close()
 
-	// No speak_start dispatch — the camera plays whatever audio frames land in
-	// the ring (matches agora). Best-effort audio-flow ping, then EOS at the end.
-	audioPlayPing()
+	// Open a speak session (best-effort) so the media daemon runs its audio-out
+	// reader, then write frames; EOS marker at the end.
+	startTalkback()
 	defer mb.WriteAudioFrame(nil, uint64(time.Now().UnixNano()/1000), 0)
 
 	enc := newAACEncoder(talkbackSampleRate, 1)

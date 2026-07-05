@@ -21,10 +21,9 @@ const talkbackSampleRate = 16000
 // camera and wires the incoming RTP audio through the transcode-and-write path.
 func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiver) error {
 	if p.sender == nil {
-		// The camera plays whatever audio frames land in the ring — no
-		// speak_start dispatch is required (agora doesn't send one). The pings
-		// are best-effort hints, matching agora's audio monitor thread.
-		audioPlayPing()
+		// Open a speak session (best-effort) so the media daemon runs its
+		// "auido-out" reader, then feed AAC frames into the ring.
+		startTalkback()
 		p.enc = newAACEncoder(talkbackSampleRate, 1)
 		p.pcmBuf = p.pcmBuf[:0]
 		p.sender = core.NewSender(media, track.Codec)

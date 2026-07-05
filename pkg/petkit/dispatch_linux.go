@@ -46,13 +46,26 @@ func sendMediaType(dst, msgID, src uint16, mediaType uint32) error {
 	return dispatchSend(dst, msgID, payload[:])
 }
 
-// audioPlayPing replicates the two control messages agora fires from its audio
-// monitor thread while remote audio is playing. The app does NOT send any
-// module-2 "speak_start" — playback is driven purely by writing audio frames to
-// the ring — so these are best-effort hints, never fatal.
-func audioPlayPing() {
-	_ = dispatchSend(10, 1, nil)                 // (0x0a, 1)
-	_ = dispatchSend(13, 1, []byte{0, 0, 0, 0}) // (0x0d, 1, {0})
+// The media/audio daemon (DISPATCH_RECEIVER_MEDIA, module 2) talkback verbs.
+// In the app another daemon opens the speak session when an Agora call starts;
+// nothing does that for us, so we send them ourselves. All best-effort (they
+// need mqueue write access, i.e. running as root) — never fatal.
+const (
+	dispatchMediaModule uint16 = 2
+	msgSpeakStart       uint16 = 5
+	msgSpeakerEnable    uint16 = 18
+)
+
+// startTalkback opens a speak session on the media daemon and fires agora's
+// audio-flow pings. Best-effort: failures are ignored so the frame-write path
+// still runs (the session may already be open).
+func startTalkback() {
+	var on [4]byte
+	on[0] = 1
+	_ = dispatchSend(dispatchMediaModule, msgSpeakerEnable, on[:]) // power speaker
+	_ = dispatchSend(dispatchMediaModule, msgSpeakStart, nil)      // spawn auido-out reader
+	_ = dispatchSend(10, 1, nil)                                   // agora ping (0x0a,1)
+	_ = dispatchSend(13, 1, []byte{0, 0, 0, 0})                    // agora ping (0x0d,1,{0})
 }
 
 // mqOpen opens (creating if necessary) a POSIX message queue for writing,
