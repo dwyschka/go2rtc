@@ -4,7 +4,32 @@ import (
 	"bytes"
 	"encoding/binary"
 	"testing"
+
+	"github.com/AlexxIT/go2rtc/pkg/aac"
 )
+
+func TestAACSilenceFrameIsValidADTS(t *testing.T) {
+	enc := newAACEncoder(16000, 1)
+	frame := enc.EncodeFrame(make([]int16, aacFrameSamples))
+
+	if !aac.IsADTS(frame) {
+		t.Fatalf("not a valid ADTS frame: % x", frame[:min(7, len(frame))])
+	}
+	if got := int(aac.ReadADTSSize(frame)); got != len(frame) {
+		t.Fatalf("ADTS frame_length %d != actual %d", got, len(frame))
+	}
+	// 16 kHz mono AAC-LC -> the decoder must recognise the codec.
+	if c := aac.ADTSToCodec(frame); c == nil || c.ClockRate != 16000 || c.Channels != 1 {
+		t.Fatalf("bad codec from ADTS: %+v", c)
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 func TestParseSource(t *testing.T) {
 	tests := []struct {

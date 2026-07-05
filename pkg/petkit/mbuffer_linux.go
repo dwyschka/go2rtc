@@ -30,9 +30,15 @@ const (
 const (
 	offWriteNum = 0x18 // sequence number of newest committed frame
 	offMinNum   = 0x1c // oldest still-available sequence number
+	offDataLen  = 0x20 // bytes currently occupied in the ring
 	offTailPos  = 0x24 // ring offset of the oldest frame
 	offHeadPos  = 0x28 // ring offset of the write head
 )
+
+// audioOutType is the type_flags value (header +0x22) that the media daemon's
+// "auido-out" reader filters on for talkback audio. Note this is bit1 (value 2),
+// distinct from the capture-audio bit used elsewhere.
+const audioOutType uint16 = 0x0002
 
 // Reader-slot field offsets (relative to the slot base).
 const (
@@ -155,6 +161,97 @@ func (mb *MBuffer) storeU16(off int, v uint16) {
 // wrap-around at the ring boundary.
 func (mb *MBuffer) ringCopy(off, n uint32) []byte {
 	return ringRead(mb.ring, off, n)
+}
+
+// ringWrite writes src into the ring starting at byte offset off, wrapping at
+// the ring boundary.
+func (mb *MBuffer) ringWrite(off uint32, src []byte) {
+	n := uint32(len(src))
+	if off+n <= mb.ringSize {
+		copy(mb.ring[off:off+n], src)
+	} else {
+		first := mb.ringSize - off
+		copy(mb.ring[off:mb.ringSize], src[:first])
+		copy(mb.ring[:n-first], src[first:])
+	}
+}
+
+// WriteAudioFrame appends one ADTS-AAC frame to the ring, tagged as talkback
+// audio (type_flags=0x0002) so the media daemon's "auido-out" reader decodes it
+// and plays it on the speaker. It is a direct port of libbase's
+// mbuffer_write_frame: take the shared lock, evict oldest frames if the ring is
+// full, write the 0x38 header + payload at head_pos, then advance the counters.
+//
+// We are a second writer on the same ring the camera uses for video; the shared
+// mutex serialises us with it, and video readers skip our frames by media-type.
+//
+// The media reader wakes on its own 500 ms poll, so no semaphore post is needed
+// for continuous audio (only the very first frame after an idle gap can incur up
+// to 500 ms latency).
+func (mb *MBuffer) WriteAudioFrame(aac []byte, ptsUs uint64, frameIndex uint32) error {
+	size := uint32(len(aac))
+	if size == 0 {
+		return nil
+	}
+	if size+frameHdrSize > mb.ringSize {
+		return errFrameSize
+	}
+
+	if err := mb.mu.Lock(lockTimeout); err != nil {
+		return err
+	}
+	defer mb.mu.Unlock()
+
+	writeNum := mb.loadU32(offWriteNum)
+	minNum := mb.loadU32(offMinNum)
+	dataLen := mb.loadU32(offDataLen)
+	tailPos := mb.loadU32(offTailPos)
+	headPos := mb.loadU32(offHeadPos)
+
+	// Sanity reset if the control block looks corrupt.
+	if headPos > mb.ringMask || tailPos > mb.ringMask || dataLen > mb.ringSize {
+		writeNum, minNum, dataLen, tailPos, headPos = 0, 0, 0, 0, 0
+	}
+
+	// Evict oldest frames until the new one fits.
+	for size+frameHdrSize+dataLen > mb.ringSize {
+		raw := mb.ringCopy(tailPos, frameHdrSize)
+		oldSize := binary.LittleEndian.Uint32(raw[0x04:])
+		oldNum := binary.LittleEndian.Uint32(raw[0x00:])
+		if dataLen < oldSize+frameHdrSize || oldNum != minNum {
+			// Ring inconsistent — reset to empty.
+			writeNum, minNum, dataLen, tailPos, headPos = 0, 0, 0, 0, 0
+			break
+		}
+		tailPos = (tailPos + oldSize + frameHdrSize) & mb.ringMask
+		dataLen -= oldSize + frameHdrSize
+		minNum = oldNum + 1
+	}
+
+	writeNum++
+	var hdr [frameHdrSize]byte
+	binary.LittleEndian.PutUint32(hdr[0x00:], writeNum)     // num
+	binary.LittleEndian.PutUint32(hdr[0x04:], size)         // size
+	binary.LittleEndian.PutUint32(hdr[0x08:], frameIndex)   // frame_index
+	binary.LittleEndian.PutUint64(hdr[0x10:], ptsUs)        // pts (us)
+	hdr[0x20] = 0                                           // frame_type (not a video I/P)
+	binary.LittleEndian.PutUint16(hdr[0x22:], audioOutType) // type_flags: audio
+
+	if dataLen == 0 {
+		minNum = writeNum
+	}
+	mb.ringWrite(headPos, hdr[:])
+	headPos = (headPos + frameHdrSize) & mb.ringMask
+	mb.ringWrite(headPos, aac)
+	headPos = (headPos + size) & mb.ringMask
+	dataLen += size + frameHdrSize
+
+	mb.storeU32(offWriteNum, writeNum)
+	mb.storeU32(offMinNum, minNum)
+	mb.storeU32(offDataLen, dataLen)
+	mb.storeU32(offTailPos, tailPos)
+	mb.storeU32(offHeadPos, headPos)
+	return nil
 }
 
 // Reader is a registered consumer of the ring, mirroring tserver's "ts-server"

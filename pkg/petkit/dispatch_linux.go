@@ -10,22 +10,25 @@ import (
 
 // The dispatch subsystem (libbase msgdispatch.c) delivers small control
 // messages between the camera's processes over POSIX message queues named
-// "/msg_dispatch_<module>". On stream start tserver tells module 1 which media
-// plane/audio it wants by sending the media_type bitmask.
+// "/msg_dispatch_<module>". Messages are little-endian: [0:2] msg_id, [2:4] src
+// module (we are not registered -> 0), [4:] payload.
 const (
-	dispatchDstModule uint16 = 1 // camera media manager
+	dispatchDstModule uint16 = 1 // camera media manager (video)
 	dispatchMsgID     uint16 = 1 // "set frame type" message id
-	dispatchSrcModule uint16 = 0 // tserver never registers a src id -> 0
+	dispatchSrcModule uint16 = 0 // we never register a src id -> 0
+
+	// The media/audio daemon (DISPATCH_RECEIVER_MEDIA) and its talkback verbs.
+	dispatchMediaModule uint16 = 2  // audio/media daemon
+	msgSpeakStart       uint16 = 5  // start talkback: spawn the "auido-out" reader
+	msgSpeakStop        uint16 = 6  // stop talkback
+	msgSpeakerEnable    uint16 = 18 // power the speaker on/off (payload: uint32 1/0)
 
 	mqMaxMsg  = 128 // mq_attr.mq_maxmsg
 	mqMsgSize = 544 // mq_attr.mq_msgsize (0x220)
 )
 
-// sendMediaType opens "/msg_dispatch_<dst>" and sends one message telling the
-// camera pipeline which plane/audio to produce. Wire format (little-endian):
-//
-//	[0:2] msg_id   [2:4] src   [4:8] media_type
-func sendMediaType(dst, msgID, src uint16, mediaType uint32) error {
+// dispatchSend sends one control message to "/msg_dispatch_<dst>".
+func dispatchSend(dst, msgID uint16, payload []byte) error {
 	name := "/msg_dispatch_" + strconv.FormatUint(uint64(dst), 10)
 
 	mqd, err := mqOpen(name)
@@ -34,12 +37,36 @@ func sendMediaType(dst, msgID, src uint16, mediaType uint32) error {
 	}
 	defer unix.Close(int(mqd))
 
-	var msg [8]byte
+	msg := make([]byte, 4+len(payload))
 	binary.LittleEndian.PutUint16(msg[0:], msgID)
-	binary.LittleEndian.PutUint16(msg[2:], src)
-	binary.LittleEndian.PutUint32(msg[4:], mediaType)
+	binary.LittleEndian.PutUint16(msg[2:], dispatchSrcModule)
+	copy(msg[4:], payload)
 
-	return mqSend(mqd, msg[:])
+	return mqSend(mqd, msg)
+}
+
+// sendMediaType tells the camera pipeline which plane/audio to produce.
+func sendMediaType(dst, msgID, src uint16, mediaType uint32) error {
+	var payload [4]byte
+	binary.LittleEndian.PutUint32(payload[:], mediaType)
+	return dispatchSend(dst, msgID, payload[:])
+}
+
+// speakStart / speakStop start and stop a talkback session on the media daemon.
+// speak_start spawns the daemon's "auido-out" ring reader that decodes the AAC
+// we write and plays it on the speaker.
+func speakStart() error { return dispatchSend(dispatchMediaModule, msgSpeakStart, nil) }
+func speakStop() error  { return dispatchSend(dispatchMediaModule, msgSpeakStop, nil) }
+
+// speakerEnable powers the speaker device on or off.
+func speakerEnable(on bool) error {
+	var v uint32
+	if on {
+		v = 1
+	}
+	var payload [4]byte
+	binary.LittleEndian.PutUint32(payload[:], v)
+	return dispatchSend(dispatchMediaModule, msgSpeakerEnable, payload[:])
 }
 
 // mqOpen opens (creating if necessary) a POSIX message queue for writing,

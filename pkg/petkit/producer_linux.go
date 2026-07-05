@@ -65,6 +65,13 @@ type Producer struct {
 	audio *core.Receiver
 
 	needKey bool // after a frame loss, drop video until the next keyframe
+
+	// backchannel (talkback: browser mic -> camera speaker)
+	sender     *core.Sender
+	enc        *aacEncoder
+	pcmBuf     []int16 // 16 kHz mono accumulator until a 1024-sample AAC frame
+	prevSample int16   // last 8 kHz sample, for 2x upsampling
+	aacIdx     uint32  // frame_index for written audio frames
 }
 
 // Dial opens the shared-memory ring, registers the "ts-server" reader, tells
@@ -194,6 +201,17 @@ func (p *Producer) probe() (err error) {
 		})
 	}
 
+	// Talkback backchannel: advertise that we accept G.711 A-law audio to play
+	// on the camera speaker. Browsers negotiate PCMA directly over WebRTC, which
+	// avoids needing an Opus decoder on the device.
+	p.Medias = append(p.Medias, &core.Media{
+		Kind:      core.KindAudio,
+		Direction: core.DirectionSendonly,
+		Codecs: []*core.Codec{
+			{Name: core.CodecPCMA, ClockRate: 8000, PayloadType: 8},
+		},
+	})
+
 	return nil
 }
 
@@ -295,6 +313,10 @@ func (p *Producer) writeAudio(f *Frame) {
 // Stop releases the reader slot and unmaps the shared memory.
 func (p *Producer) Stop() error {
 	err := p.Connection.Stop()
+	if p.sender != nil {
+		p.sender.Close()
+		_ = speakStop()
+	}
 	if p.reader != nil {
 		p.reader.Release()
 	}
