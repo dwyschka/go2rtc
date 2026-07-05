@@ -188,11 +188,10 @@ func (mb *MBuffer) ringWrite(off uint32, src []byte) {
 // The media reader wakes on its own 500 ms poll, so no semaphore post is needed
 // for continuous audio (only the very first frame after an idle gap can incur up
 // to 500 ms latency).
+// A nil/empty payload writes a header-only frame, which the media daemon reads
+// as the end-of-stream marker (matches agora's save_audio_out_stop_frame).
 func (mb *MBuffer) WriteAudioFrame(aac []byte, ptsUs uint64, frameIndex uint32) error {
 	size := uint32(len(aac))
-	if size == 0 {
-		return nil
-	}
 	if size+frameHdrSize > mb.ringSize {
 		return errFrameSize
 	}
@@ -229,13 +228,21 @@ func (mb *MBuffer) WriteAudioFrame(aac []byte, ptsUs uint64, frameIndex uint32) 
 	}
 
 	writeNum++
+	// Frame descriptor filled exactly like agora's __on_audio_data (the app's
+	// proven talkback writer): audio frames carry a codec tag + sample-count so
+	// the media daemon configures its decoder correctly.
 	var hdr [frameHdrSize]byte
-	binary.LittleEndian.PutUint32(hdr[0x00:], writeNum)     // num
-	binary.LittleEndian.PutUint32(hdr[0x04:], size)         // size
-	binary.LittleEndian.PutUint32(hdr[0x08:], frameIndex)   // frame_index
-	binary.LittleEndian.PutUint64(hdr[0x10:], ptsUs)        // pts (us)
-	hdr[0x20] = 0                                           // frame_type (not a video I/P)
-	binary.LittleEndian.PutUint16(hdr[0x22:], audioOutType) // type_flags: audio
+	binary.LittleEndian.PutUint32(hdr[0x00:], writeNum)              // num
+	binary.LittleEndian.PutUint32(hdr[0x04:], size)                  // size
+	binary.LittleEndian.PutUint32(hdr[0x0c:], uint32(time.Now().Unix())) // wall sec
+	binary.LittleEndian.PutUint64(hdr[0x10:], ptsUs)                 // pts (us)
+	binary.LittleEndian.PutUint64(hdr[0x18:], ptsUs)                 // local capture (us)
+	hdr[0x20] = 0                                                    // frame_type
+	hdr[0x21] = 4                                                    // codec = AAC
+	binary.LittleEndian.PutUint16(hdr[0x22:], audioOutType)          // type_flags = 0x0002
+	binary.LittleEndian.PutUint16(hdr[0x2e:], 0x0400)               // 1024 samples/frame (AAC-LC)
+	binary.LittleEndian.PutUint16(hdr[0x30:], 0x0010)               // 16 (kHz/bit)
+	_ = frameIndex
 
 	if dataLen == 0 {
 		minNum = writeNum

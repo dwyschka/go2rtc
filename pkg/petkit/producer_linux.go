@@ -315,7 +315,8 @@ func (p *Producer) Stop() error {
 	err := p.Connection.Stop()
 	if p.sender != nil {
 		p.sender.Close()
-		_ = speakStop()
+		// End-of-stream marker (agora writes a zero-length audio frame on stop).
+		_ = p.mb.WriteAudioFrame(nil, uint64(time.Now().UnixNano()/1000), 0)
 	}
 	if p.reader != nil {
 		p.reader.Release()

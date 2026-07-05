@@ -17,12 +17,6 @@ const (
 	dispatchMsgID     uint16 = 1 // "set frame type" message id
 	dispatchSrcModule uint16 = 0 // we never register a src id -> 0
 
-	// The media/audio daemon (DISPATCH_RECEIVER_MEDIA) and its talkback verbs.
-	dispatchMediaModule uint16 = 2  // audio/media daemon
-	msgSpeakStart       uint16 = 5  // start talkback: spawn the "auido-out" reader
-	msgSpeakStop        uint16 = 6  // stop talkback
-	msgSpeakerEnable    uint16 = 18 // power the speaker on/off (payload: uint32 1/0)
-
 	mqMaxMsg  = 128 // mq_attr.mq_maxmsg
 	mqMsgSize = 544 // mq_attr.mq_msgsize (0x220)
 )
@@ -52,21 +46,13 @@ func sendMediaType(dst, msgID, src uint16, mediaType uint32) error {
 	return dispatchSend(dst, msgID, payload[:])
 }
 
-// speakStart / speakStop start and stop a talkback session on the media daemon.
-// speak_start spawns the daemon's "auido-out" ring reader that decodes the AAC
-// we write and plays it on the speaker.
-func speakStart() error { return dispatchSend(dispatchMediaModule, msgSpeakStart, nil) }
-func speakStop() error  { return dispatchSend(dispatchMediaModule, msgSpeakStop, nil) }
-
-// speakerEnable powers the speaker device on or off.
-func speakerEnable(on bool) error {
-	var v uint32
-	if on {
-		v = 1
-	}
-	var payload [4]byte
-	binary.LittleEndian.PutUint32(payload[:], v)
-	return dispatchSend(dispatchMediaModule, msgSpeakerEnable, payload[:])
+// audioPlayPing replicates the two control messages agora fires from its audio
+// monitor thread while remote audio is playing. The app does NOT send any
+// module-2 "speak_start" — playback is driven purely by writing audio frames to
+// the ring — so these are best-effort hints, never fatal.
+func audioPlayPing() {
+	_ = dispatchSend(10, 1, nil)                 // (0x0a, 1)
+	_ = dispatchSend(13, 1, []byte{0, 0, 0, 0}) // (0x0d, 1, {0})
 }
 
 // mqOpen opens (creating if necessary) a POSIX message queue for writing,

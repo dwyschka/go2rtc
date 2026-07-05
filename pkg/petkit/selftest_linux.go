@@ -22,13 +22,10 @@ func SelfTestTone(dur time.Duration, freqHz float64) error {
 	}
 	defer mb.Close()
 
-	if err = speakerEnable(true); err != nil {
-		return err
-	}
-	if err = speakStart(); err != nil {
-		return err
-	}
-	defer speakStop()
+	// No speak_start dispatch — the camera plays whatever audio frames land in
+	// the ring (matches agora). Best-effort audio-flow ping, then EOS at the end.
+	audioPlayPing()
+	defer mb.WriteAudioFrame(nil, uint64(time.Now().UnixNano()/1000), 0)
 
 	enc := newAACEncoder(talkbackSampleRate, 1)
 
