@@ -42,6 +42,7 @@ func SelfTestFile(path string) (err error) {
 	defer mb.Close()
 
 	startTalkback()
+	defer stopTalkback()
 	defer mb.WriteAudioFrame(nil, uint64(time.Now().UnixNano()/1000), 0)
 
 	ticker := time.NewTicker(frameDur)
@@ -108,7 +109,7 @@ func TalkbackDiag() {
 	})
 
 	step("probe queues", func() {
-		for _, name := range []string{"/msg_dispatch_2", "/msg_dispatch_10", "/msg_dispatch_13"} {
+		for _, name := range []string{"/msg_dispatch_1", "/msg_dispatch_2"} {
 			if errno := mqProbe(name); errno == 0 {
 				log("%s: OPEN OK", name)
 			} else {
@@ -148,6 +149,7 @@ func SelfTestTone(dur time.Duration, freqHz float64) (err error) {
 	// Open a speak session (best-effort) so the media daemon runs its audio-out
 	// reader, then write frames; EOS marker at the end.
 	startTalkback()
+	defer stopTalkback()
 	defer mb.WriteAudioFrame(nil, uint64(time.Now().UnixNano()/1000), 0)
 
 	enc := newAACEncoder(talkbackSampleRate, 1)

@@ -16,10 +16,11 @@ import (
 	"os"
 )
 
-// rawAAC strips the ADTS header so the ring carries raw AAC access units. The
-// media daemon's decoder is TT_MP4_ADTS (so ADTS is the default), but set
-// PETKIT_AAC_RAW=1 to try raw AU without a rebuild if that turns out wrong.
-var rawAAC = os.Getenv("PETKIT_AAC_RAW") == "1"
+// rawAAC strips the ADTS header so the ring carries raw AAC access units.
+// agora_arm on the AXERA device writes raw AAC-LC AUs (no ADTS; codec/samples
+// live in the frame descriptor), so raw is the default. Set PETKIT_AAC_ADTS=1
+// to force ADTS instead (e.g. for the older Ingenic/MIPS firmware).
+var rawAAC = os.Getenv("PETKIT_AAC_ADTS") != "1"
 
 // aacPayload returns the ring payload for one encoded frame: the ADTS frame as
 // produced, or the raw AAC AU (7-byte header stripped) when PETKIT_AAC_RAW=1.

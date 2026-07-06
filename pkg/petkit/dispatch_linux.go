@@ -21,8 +21,13 @@ const (
 	mqMsgSize = 544 // mq_attr.mq_msgsize (0x220)
 )
 
-// dispatchSend sends one control message to "/msg_dispatch_<dst>".
+// dispatchSend sends one control message to "/msg_dispatch_<dst>" with src 0.
 func dispatchSend(dst, msgID uint16, payload []byte) error {
+	return dispatchSendFrom(dst, msgID, dispatchSrcModule, payload)
+}
+
+// dispatchSendFrom sends a control message with an explicit src module id.
+func dispatchSendFrom(dst, msgID, src uint16, payload []byte) error {
 	name := "/msg_dispatch_" + strconv.FormatUint(uint64(dst), 10)
 
 	mqd, err := mqOpen(name)
@@ -33,7 +38,7 @@ func dispatchSend(dst, msgID uint16, payload []byte) error {
 
 	msg := make([]byte, 4+len(payload))
 	binary.LittleEndian.PutUint16(msg[0:], msgID)
-	binary.LittleEndian.PutUint16(msg[2:], dispatchSrcModule)
+	binary.LittleEndian.PutUint16(msg[2:], src)
 	copy(msg[4:], payload)
 
 	return mqSend(mqd, msg)
@@ -47,25 +52,28 @@ func sendMediaType(dst, msgID, src uint16, mediaType uint32) error {
 }
 
 // The media/audio daemon (DISPATCH_RECEIVER_MEDIA, module 2) talkback verbs.
-// In the app another daemon opens the speak session when an Agora call starts;
-// nothing does that for us, so we send them ourselves. All best-effort (they
-// need mqueue write access, i.e. running as root) — never fatal.
+// Talkback control (verified from agora_arm on the actual ARM/AXERA device):
+// the speaker is owned by media daemon module 1, which registers its ring
+// reader only after an "audio play" message. agora sends it impersonating
+// itself (src module 7). Start = msg 0x0a, stop = 0x0b, both to /msg_dispatch_1.
 const (
-	dispatchMediaModule uint16 = 2
-	msgSpeakStart       uint16 = 5
-	msgSpeakerEnable    uint16 = 18
+	dispatchAudioModule uint16 = 1
+	msgAudioStart       uint16 = 0x0a
+	msgAudioStop        uint16 = 0x0b
+	msgAudioFlag        uint16 = 0x0d
+	agoraSrcModule      uint16 = 7
 )
 
-// startTalkback opens a speak session on the media daemon and fires agora's
-// audio-flow pings. Best-effort: failures are ignored so the frame-write path
-// still runs (the session may already be open).
+// startTalkback tells module 1 to start its speaker ring reader, exactly like
+// agora's audio watchdog. Best-effort — failures are ignored.
 func startTalkback() {
-	var on [4]byte
-	on[0] = 1
-	_ = dispatchSend(dispatchMediaModule, msgSpeakerEnable, on[:]) // power speaker
-	_ = dispatchSend(dispatchMediaModule, msgSpeakStart, nil)      // spawn auido-out reader
-	_ = dispatchSend(10, 1, nil)                                   // agora ping (0x0a,1)
-	_ = dispatchSend(13, 1, []byte{0, 0, 0, 0})                    // agora ping (0x0d,1,{0})
+	_ = dispatchSendFrom(dispatchAudioModule, msgAudioFlag, agoraSrcModule, []byte{0, 0, 0, 0})
+	_ = dispatchSendFrom(dispatchAudioModule, msgAudioStart, agoraSrcModule, nil)
+}
+
+// stopTalkback tells module 1 to stop the speaker ring reader.
+func stopTalkback() {
+	_ = dispatchSendFrom(dispatchAudioModule, msgAudioStop, agoraSrcModule, nil)
 }
 
 // mqOpen opens (creating if necessary) a POSIX message queue for writing,
