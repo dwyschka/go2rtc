@@ -72,7 +72,7 @@ func startTalkback() {
 // matching the attributes libbase uses so it interoperates whether or not the
 // queue already exists.
 func mqOpen(name string) (uintptr, error) {
-	np, err := unix.BytePtrFromString(name)
+	np, err := unix.BytePtrFromString(mqSyscallName(name))
 	if err != nil {
 		return 0, err
 	}
@@ -107,10 +107,21 @@ func mqOpen(name string) (uintptr, error) {
 	return mqd, nil
 }
 
+// mqSyscallName strips the leading '/' from a POSIX mqueue name. glibc's
+// mq_open does this before the raw SYS_mq_open syscall; the kernel's
+// lookup_one_len rejects any embedded '/' with EACCES, so passing "/name"
+// directly to the syscall fails for everyone, even root.
+func mqSyscallName(name string) string {
+	if len(name) > 0 && name[0] == '/' {
+		return name[1:]
+	}
+	return name
+}
+
 // mqProbe attempts to open an existing queue (no create) for diagnostics and
 // returns the raw errno (0 = success).
 func mqProbe(name string) unix.Errno {
-	np, err := unix.BytePtrFromString(name)
+	np, err := unix.BytePtrFromString(mqSyscallName(name))
 	if err != nil {
 		return unix.EINVAL
 	}
