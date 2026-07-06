@@ -259,6 +259,26 @@ func (mb *MBuffer) WriteAudioFrame(aac []byte, ptsUs uint64, frameIndex uint32) 
 	mb.storeU32(offDataLen, dataLen)
 	mb.storeU32(offTailPos, tailPos)
 	mb.storeU32(offHeadPos, headPos)
+
+	// Wake any reader parked in sem_timedwait whose filter matches this frame
+	// (mirrors mbuffer_write_frame's per-slot wake loop). Without this the media
+	// daemon's "auido-out" reader stays asleep and never plays our audio.
+	for i := 0; i < slotCount; i++ {
+		base := slotArrayOff + i*slotSize
+		if mb.loadU32(base+slotActive) == 0 {
+			continue
+		}
+		mask := binary.LittleEndian.Uint16(mb.data[base+slotFilterMask:])
+		if mask&audioOutType == 0 {
+			continue
+		}
+		if mb.loadU32(base+slotWantWakeup) == 0 {
+			continue
+		}
+		idx := binary.LittleEndian.Uint16(mb.data[base+slotIndex:])
+		mb.storeU32(base+slotWantWakeup, 0) // clear the gate before posting
+		semPost(idx)
+	}
 	return nil
 }
 
