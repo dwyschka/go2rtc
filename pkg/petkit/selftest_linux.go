@@ -7,48 +7,58 @@ import (
 	"time"
 )
 
-// TalkbackDiag probes the pieces the talkback path needs and returns a
-// human-readable report: privilege level, shared-memory access, and whether
-// each dispatch mqueue can be written. Use it to pinpoint why no sound plays.
-func TalkbackDiag() []string {
-	var r []string
-	r = append(r, fmt.Sprintf("euid=%d (root=%v)", os.Geteuid(), os.Geteuid() == 0))
+// TalkbackDiag probes the pieces the talkback path needs, printing each step
+// live so a crash's last line pinpoints the failing operation. Each step is
+// wrapped in recover() so one failure doesn't abort the rest.
+func TalkbackDiag() {
+	log := func(format string, a ...any) { fmt.Printf("  "+format+"\n", a...) }
+
+	step := func(name string, fn func()) {
+		defer func() {
+			if e := recover(); e != nil {
+				log("%s: PANIC %v", name, e)
+			}
+		}()
+		fn()
+	}
+
+	log("euid=%d (root=%v)", os.Geteuid(), os.Geteuid() == 0)
 
 	mb, err := OpenMBuffer()
 	if err != nil {
-		return append(r, "shm /media_buffer_frame_buf: FAIL — "+err.Error())
+		log("shm /media_buffer_frame_buf: FAIL — %v", err)
+		return
 	}
 	defer mb.Close()
-	r = append(r, fmt.Sprintf("shm /media_buffer_frame_buf: OK (ring %d bytes)", mb.ringSize))
+	log("shm /media_buffer_frame_buf: OK (ring %d bytes)", mb.ringSize)
 
-	// List the POSIX mqueue filesystem, if mounted, so we can see the queues
-	// and their permissions.
-	if entries, err := os.ReadDir("/dev/mqueue"); err != nil {
-		r = append(r, "/dev/mqueue: not listable — "+err.Error())
-	} else {
-		names := make([]string, 0, len(entries))
+	step("list /dev/mqueue", func() {
+		entries, err := os.ReadDir("/dev/mqueue")
+		if err != nil {
+			log("/dev/mqueue: not listable — %v", err)
+			return
+		}
+		var names []string
 		for _, e := range entries {
 			names = append(names, e.Name())
 		}
-		r = append(r, fmt.Sprintf("/dev/mqueue: %v", names))
-	}
+		log("/dev/mqueue: %v", names)
+	})
 
-	for _, name := range []string{"/msg_dispatch_2", "/msg_dispatch_10", "/msg_dispatch_13"} {
-		errno := mqProbe(name)
-		if errno == 0 {
-			r = append(r, name+": OPEN OK")
-		} else {
-			r = append(r, fmt.Sprintf("%s: errno=%d (%v)", name, int(errno), errno))
+	step("probe queues", func() {
+		for _, name := range []string{"/msg_dispatch_2", "/msg_dispatch_10", "/msg_dispatch_13"} {
+			if errno := mqProbe(name); errno == 0 {
+				log("%s: OPEN OK", name)
+			} else {
+				log("%s: errno=%d (%v)", name, int(errno), errno)
+			}
 		}
-	}
+	})
 
-	// Show the ring's reader slots before and after speak_start — the media
-	// daemon's audio reader (mask 0x02) should appear once the session opens.
-	r = append(r, fmt.Sprintf("readers before:      %v", mb.ActiveReaders()))
-	startTalkback()
+	step("readers before", func() { log("readers before:      %v", mb.ActiveReaders()) })
+	step("startTalkback", func() { startTalkback() })
 	time.Sleep(300 * time.Millisecond)
-	r = append(r, fmt.Sprintf("readers after speak: %v", mb.ActiveReaders()))
-	return r
+	step("readers after", func() { log("readers after speak: %v", mb.ActiveReaders()) })
 }
 
 // SelfTestTone plays a sine tone on the camera speaker for the given duration
@@ -57,7 +67,12 @@ func TalkbackDiag() []string {
 // HTTPS — the fastest way to confirm the speaker path works.
 //
 // freqHz is the tone frequency; 0 uses 1000 Hz.
-func SelfTestTone(dur time.Duration, freqHz float64) error {
+func SelfTestTone(dur time.Duration, freqHz float64) (err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			err = fmt.Errorf("petkit: recovered in SelfTestTone: %v", e)
+		}
+	}()
 	if freqHz <= 0 {
 		freqHz = 1000
 	}

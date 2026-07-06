@@ -32,9 +32,7 @@ func main() {
 	}
 
 	fmt.Println("=== talkback diagnostics ===")
-	for _, line := range petkit.TalkbackDiag() {
-		fmt.Println("  " + line)
-	}
+	petkit.TalkbackDiag()
 	fmt.Println("============================")
 
 	fmt.Printf("playing %.0f Hz tone for %.1fs on the camera speaker...\n", freq, secs)
