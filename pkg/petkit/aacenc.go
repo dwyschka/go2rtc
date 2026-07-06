@@ -13,7 +13,22 @@ package petkit
 import (
 	"math"
 	"math/bits"
+	"os"
 )
+
+// rawAAC strips the ADTS header so the ring carries raw AAC access units. The
+// media daemon's decoder is TT_MP4_ADTS (so ADTS is the default), but set
+// PETKIT_AAC_RAW=1 to try raw AU without a rebuild if that turns out wrong.
+var rawAAC = os.Getenv("PETKIT_AAC_RAW") == "1"
+
+// aacPayload returns the ring payload for one encoded frame: the ADTS frame as
+// produced, or the raw AAC AU (7-byte header stripped) when PETKIT_AAC_RAW=1.
+func aacPayload(adts []byte) []byte {
+	if rawAAC && len(adts) > 7 {
+		return adts[7:]
+	}
+	return adts
+}
 
 const (
 	aacFrameSamples = 1024      // AAC-LC long-window frame length (N)

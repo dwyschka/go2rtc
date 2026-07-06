@@ -41,6 +41,13 @@ func TalkbackDiag() []string {
 			r = append(r, fmt.Sprintf("%s: errno=%d (%v)", name, int(errno), errno))
 		}
 	}
+
+	// Show the ring's reader slots before and after speak_start — the media
+	// daemon's audio reader (mask 0x02) should appear once the session opens.
+	r = append(r, fmt.Sprintf("readers before:      %v", mb.ActiveReaders()))
+	startTalkback()
+	time.Sleep(300 * time.Millisecond)
+	r = append(r, fmt.Sprintf("readers after speak: %v", mb.ActiveReaders()))
 	return r
 }
 
@@ -84,7 +91,7 @@ func SelfTestTone(dur time.Duration, freqHz float64) error {
 			phase += step
 		}
 		if adts := enc.EncodeFrame(pcm); len(adts) > 0 {
-			if err = mb.WriteAudioFrame(adts, uint64(time.Now().UnixNano()/1000), idx); err != nil {
+			if err = mb.WriteAudioFrame(aacPayload(adts), uint64(time.Now().UnixNano()/1000), idx); err != nil {
 				return err
 			}
 			idx++

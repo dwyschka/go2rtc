@@ -47,7 +47,7 @@ func (p *Producer) handleTalkbackRTP(pkt *rtp.Packet) {
 	for len(p.pcmBuf) >= aacFrameSamples {
 		adts := p.enc.EncodeFrame(p.pcmBuf[:aacFrameSamples])
 		if len(adts) > 0 {
-			_ = p.mb.WriteAudioFrame(adts, uint64(time.Now().UnixNano()/1000), p.aacIdx)
+			_ = p.mb.WriteAudioFrame(aacPayload(adts), uint64(time.Now().UnixNano()/1000), p.aacIdx)
 			p.aacIdx++
 		}
 		p.pcmBuf = p.pcmBuf[aacFrameSamples:]

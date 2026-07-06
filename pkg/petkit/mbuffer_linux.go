@@ -261,6 +261,28 @@ func (mb *MBuffer) WriteAudioFrame(aac []byte, ptsUs uint64, frameIndex uint32) 
 	return nil
 }
 
+// ActiveReaders lists each registered reader slot as name(mask=0xNN). Used to
+// confirm the media daemon started its "auido-out" audio reader (filter mask
+// 0x0002) after we sent speak_start.
+func (mb *MBuffer) ActiveReaders() []string {
+	if err := mb.mu.Lock(lockTimeout); err != nil {
+		return []string{"lock: " + err.Error()}
+	}
+	defer mb.mu.Unlock()
+
+	var out []string
+	for i := 0; i < slotCount; i++ {
+		base := slotArrayOff + i*slotSize
+		if mb.loadU32(base+slotActive) == 0 {
+			continue
+		}
+		name := cstr(mb.data[base+slotName : base+slotName+16])
+		mask := binary.LittleEndian.Uint16(mb.data[base+slotFilterMask:])
+		out = append(out, fmt.Sprintf("%q(mask=0x%02x)", name, mask))
+	}
+	return out
+}
+
 // Reader is a registered consumer of the ring, mirroring tserver's "ts-server"
 // reader. last-read bookkeeping is kept process-local (the producer never reads
 // it); only the slot's name/index/filter/active/want_wakeup fields live in the
