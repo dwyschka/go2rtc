@@ -1,11 +1,73 @@
 package petkit
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"os"
 	"time"
+
+	"github.com/AlexxIT/go2rtc/pkg/aac"
 )
+
+// SelfTestFile plays an existing ADTS-AAC file through the talkback ring path:
+// it parses the file's AAC frames and writes each into the ring, paced in real
+// time. This uses device-native audio so it isolates the ring/reader path from
+// our own encoder.
+func SelfTestFile(path string) (err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			err = fmt.Errorf("petkit: recovered in SelfTestFile: %v", e)
+		}
+	}()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if !aac.IsADTS(data) {
+		return errors.New("petkit: not an ADTS-AAC file: " + path)
+	}
+	rate := 16000
+	if c := aac.ADTSToCodec(data); c != nil {
+		rate = int(c.ClockRate)
+	}
+	frameDur := time.Duration(aacFrameSamples) * time.Second / time.Duration(rate)
+	fmt.Printf("playing %s: %d bytes, %d Hz, frame=%v\n", path, len(data), rate, frameDur)
+
+	mb, err := OpenMBuffer()
+	if err != nil {
+		return err
+	}
+	defer mb.Close()
+
+	startTalkback()
+	defer mb.WriteAudioFrame(nil, uint64(time.Now().UnixNano()/1000), 0)
+
+	ticker := time.NewTicker(frameDur)
+	defer ticker.Stop()
+
+	var idx uint32
+	var ptsUs uint64
+	for i := 0; i+aac.ADTSHeaderSize <= len(data); {
+		if !aac.IsADTS(data[i:]) {
+			break
+		}
+		size := int(aac.ReadADTSSize(data[i:]))
+		if size < aac.ADTSHeaderSize || i+size > len(data) {
+			break
+		}
+		if err = mb.WriteAudioFrame(aacPayload(data[i:i+size]), ptsUs, idx); err != nil {
+			return err
+		}
+		i += size
+		idx++
+		ptsUs += uint64(frameDur.Microseconds())
+		<-ticker.C
+	}
+	fmt.Printf("wrote %d AAC frames\n", idx)
+	return nil
+}
 
 // TalkbackDiag probes the pieces the talkback path needs, printing each step
 // live so a crash's last line pinpoints the failing operation. Each step is
