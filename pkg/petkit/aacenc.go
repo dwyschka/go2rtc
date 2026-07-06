@@ -14,6 +14,8 @@ import (
 	"math"
 	"math/bits"
 	"os"
+
+	"github.com/AlexxIT/go2rtc/pkg/aac"
 )
 
 // rawAAC strips the ADTS header so the ring carries raw AAC access units.
@@ -22,11 +24,14 @@ import (
 // to force ADTS instead (e.g. for the older Ingenic/MIPS firmware).
 var rawAAC = os.Getenv("PETKIT_AAC_ADTS") != "1"
 
-// aacPayload returns the ring payload for one encoded frame: the ADTS frame as
-// produced, or the raw AAC AU (7-byte header stripped) when PETKIT_AAC_RAW=1.
+// aacPayload returns the ring payload for one encoded frame: the raw AAC AU
+// (ADTS header stripped, honoring the CRC-present length) by default, or the
+// full ADTS frame when PETKIT_AAC_ADTS=1.
 func aacPayload(adts []byte) []byte {
-	if rawAAC && len(adts) > 7 {
-		return adts[7:]
+	if rawAAC && aac.IsADTS(adts) {
+		if n := aac.ADTSHeaderLen(adts); len(adts) > n {
+			return adts[n:]
+		}
 	}
 	return adts
 }

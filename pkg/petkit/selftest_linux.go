@@ -48,6 +48,8 @@ func SelfTestFile(path string) (err error) {
 	ticker := time.NewTicker(frameDur)
 	defer ticker.Stop()
 
+	fmt.Printf("readers at start: %v (write_num=%d)\n", mb.ActiveReaders(), mb.WriteNum())
+
 	var idx uint32
 	var ptsUs uint64
 	for i := 0; i+aac.ADTSHeaderSize <= len(data); {
@@ -67,6 +69,7 @@ func SelfTestFile(path string) (err error) {
 		<-ticker.C
 	}
 	fmt.Printf("wrote %d AAC frames\n", idx)
+	fmt.Printf("readers at end:   %v (write_num=%d)\n", mb.ActiveReaders(), mb.WriteNum())
 	return nil
 }
 
@@ -163,6 +166,8 @@ func SelfTestTone(dur time.Duration, freqHz float64) (err error) {
 	ticker := time.NewTicker(frameDur)
 	defer ticker.Stop()
 
+	fmt.Printf("readers at start: %v (write_num=%d)\n", mb.ActiveReaders(), mb.WriteNum())
+
 	var idx uint32
 	for i := 0; i < frames; i++ {
 		for j := range pcm {
@@ -177,5 +182,6 @@ func SelfTestTone(dur time.Duration, freqHz float64) (err error) {
 		}
 		<-ticker.C
 	}
+	fmt.Printf("readers at end:   %v (write_num=%d)\n", mb.ActiveReaders(), mb.WriteNum())
 	return nil
 }

@@ -45,6 +45,7 @@ const (
 	slotName       = 0x00 // char[16]
 	slotIndex      = 0x10 // uint16, slot number (seeded by the producer)
 	slotFilterMask = 0x12 // uint16, wanted media bits
+	slotLastNum    = 0x14 // uint32, last frame sequence the reader consumed
 	slotBufCap     = 0x1c // uint32, producer-side copy-out buffer size (unused here)
 	slotBufPtr     = 0x20 // void*, producer-side buffer pointer (unused here)
 	slotActive     = 0x24 // uint32, 1 = slot in use
@@ -278,10 +279,16 @@ func (mb *MBuffer) ActiveReaders() []string {
 		}
 		name := cstr(mb.data[base+slotName : base+slotName+16])
 		mask := binary.LittleEndian.Uint16(mb.data[base+slotFilterMask:])
-		out = append(out, fmt.Sprintf("%q(mask=0x%02x)", name, mask))
+		wake := mb.loadU32(base + slotWantWakeup)
+		lastNum := mb.loadU32(base + slotLastNum)
+		out = append(out, fmt.Sprintf("%q(mask=0x%02x wake=%d num=%d)", name, mask, wake, lastNum))
 	}
 	return out
 }
+
+// WriteNum returns the ring's current newest-frame sequence number, for
+// diagnostics (compare against a reader's num to see if it is keeping up).
+func (mb *MBuffer) WriteNum() uint32 { return mb.loadU32(offWriteNum) }
 
 // Reader is a registered consumer of the ring, mirroring tserver's "ts-server"
 // reader. last-read bookkeeping is kept process-local (the producer never reads
