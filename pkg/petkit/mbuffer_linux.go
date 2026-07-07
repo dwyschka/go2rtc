@@ -301,7 +301,8 @@ func (mb *MBuffer) ActiveReaders() []string {
 		mask := binary.LittleEndian.Uint16(mb.data[base+slotFilterMask:])
 		wake := mb.loadU32(base + slotWantWakeup)
 		lastNum := mb.loadU32(base + slotLastNum)
-		out = append(out, fmt.Sprintf("%q(mask=0x%02x wake=%d num=%d)", name, mask, wake, lastNum))
+		idx := binary.LittleEndian.Uint16(mb.data[base+slotIndex:])
+		out = append(out, fmt.Sprintf("%q(idx=%d mask=0x%02x wake=%d num=%d)", name, idx, mask, wake, lastNum))
 	}
 	return out
 }

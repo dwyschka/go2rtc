@@ -111,6 +111,21 @@ func TalkbackDiag() {
 		log("/dev/mqueue: %v", names)
 	})
 
+	step("list /dev/shm sem files", func() {
+		entries, err := os.ReadDir("/dev/shm")
+		if err != nil {
+			log("/dev/shm: %v", err)
+			return
+		}
+		var sems []string
+		for _, e := range entries {
+			if n := e.Name(); len(n) >= 4 && n[:4] == "sem." {
+				sems = append(sems, n)
+			}
+		}
+		log("/dev/shm sem files: %v", sems)
+	})
+
 	step("probe queues", func() {
 		for _, name := range []string{"/msg_dispatch_1", "/msg_dispatch_2"} {
 			if errno := mqProbe(name); errno == 0 {
