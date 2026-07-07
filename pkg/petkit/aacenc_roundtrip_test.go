@@ -62,3 +62,66 @@ func TestAACRoundtrip(t *testing.T) {
 		t.Fatalf("1 kHz not dominant: e1k=%.0f eOther=%.0f", e1k, eOther)
 	}
 }
+
+// TestAACMultiToneEnvelope encodes a strong low tone plus a much quieter high
+// tone (~28 dB down) and checks BOTH survive the round-trip. A single global
+// scalefactor — the old encoder — is set by the loud tone and quantizes the
+// quiet high band coarsely, which is exactly what made speech buzzy. Per-band
+// scalefactors must preserve the weak tone well above the noise floor. Skips
+// without ffmpeg.
+func TestAACMultiToneEnvelope(t *testing.T) {
+	ff, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		t.Skip("ffmpeg not available")
+	}
+
+	enc := newAACEncoder(16000, 1)
+	var adts []byte
+	pLow, pHigh := 0.0, 0.0
+	for f := 0; f < 12; f++ {
+		pcm := make([]int16, aacFrameSamples)
+		for i := range pcm {
+			pcm[i] = int16(10000*math.Sin(pLow) + 400*math.Sin(pHigh)) // high tone ~-28 dB
+			pLow += 2 * math.Pi * 600 / 16000
+			pHigh += 2 * math.Pi * 2500 / 16000
+		}
+		adts = append(adts, enc.EncodeFrame(pcm)...)
+	}
+
+	cmd := exec.Command(ff, "-loglevel", "error", "-f", "aac", "-i", "pipe:0", "-f", "s16le", "pipe:1")
+	cmd.Stdin = bytes.NewReader(adts)
+	pcmOut, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("ffmpeg decode failed: %v", err)
+	}
+
+	n := len(pcmOut) / 2
+	samples := make([]float64, n)
+	for i := 0; i < n; i++ {
+		samples[i] = float64(int16(binary.LittleEndian.Uint16(pcmOut[2*i:])))
+	}
+	samples = samples[aacFrameSamples:] // skip MDCT warm-up frame
+
+	goertzel := func(f float64) float64 {
+		w := 2 * math.Pi * f / 16000
+		c := 2 * math.Cos(w)
+		var s1, s2 float64
+		for _, x := range samples {
+			s0 := x + c*s1 - s2
+			s2, s1 = s1, s0
+		}
+		return s1*s1 + s2*s2 - c*s1*s2
+	}
+
+	eLow := goertzel(600)
+	eHigh := goertzel(2500)
+	eNoise := goertzel(3500) + goertzel(1500) // frequencies with no input energy
+	if eLow < eHigh {
+		t.Fatalf("low tone should dominate: eLow=%.3g eHigh=%.3g", eLow, eHigh)
+	}
+	// The quiet high tone must stand well clear of the noise floor — the old
+	// global-scalefactor encoder would fail this.
+	if eHigh < 20*eNoise {
+		t.Fatalf("quiet high tone lost in noise: eHigh=%.3g eNoise=%.3g", eHigh, eNoise)
+	}
+}

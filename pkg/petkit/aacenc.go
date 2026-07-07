@@ -47,10 +47,12 @@ func aacPayload(adts []byte) []byte {
 const (
 	aacFrameSamples = 1024      // AAC-LC long-window frame length (N)
 	mdctLen         = 2048      // MDCT input length (2N)
-	targetMaxIx     = 500       // quantizer target: peak quantized value
+	targetBandIx    = 200       // per-band quantizer target: peak quantized value
+	bandFloorRatio  = 0.02      // bands below this fraction of the global peak -> zeroed
 	maxQuant        = 8191      // HCB_ESC escape range limit (MAX_HUFF_ESC_VAL)
 	sfOffset        = 100       // AAC scalefactor gain offset (SF_OFFSET)
 	escHCB          = 11        // spectral codebook we always use
+	maxSfDelta      = 60        // scalefactor DPCM range (aacBook12 is centered at 60)
 )
 
 // 16 kHz long-window scalefactor-band widths (ISO/IEC 14496-3; from FAAC).
@@ -161,75 +163,123 @@ func mdct(x, out []float64) {
 	}
 }
 
-// quantize applies a single global scalefactor chosen so the peak quantized
-// value is near targetMaxIx, then returns the scalefactor, the quantized
-// spectrum, and the highest occupied scalefactor band.
-func quantize(spec []float64) (sf int, ix [aacFrameSamples]int, maxSfb int) {
-	var maxAbs float64
+// quantize chooses a scalefactor per band so each audible band keeps good
+// precision. A single global scalefactor (the old approach) is set by the
+// loudest bin, so quiet bands — the formant detail and high-frequency energy
+// that make speech intelligible — collapse into quantization noise. It sounds
+// fine for a pure tone (one band) but buzzy for voice. Per-band scalefactors,
+// DPCM-coded, are the standard AAC-LC fix. Returns the transmitted scalefactor
+// per band, the quantized spectrum, and the highest occupied band.
+func quantize(spec []float64) (sf []int, ix [aacFrameSamples]int, maxSfb int) {
+	var globalMax float64
 	for _, v := range spec {
-		if a := math.Abs(v); a > maxAbs {
-			maxAbs = a
+		if a := math.Abs(v); a > globalMax {
+			globalMax = a
 		}
 	}
-	if maxAbs < 1e-6 {
-		return sfOffset, ix, 0 // silence
+	if globalMax < 1e-6 {
+		return nil, ix, 0 // silence
 	}
+	floor := globalMax * bandFloorRatio
 
-	// ix = (|xr|·2^(-0.25(sf-100)))^0.75 ; pick sf so peak ix ≈ targetMaxIx.
-	// => sf = 100 - log2(target / maxAbs^0.75) / 0.1875
-	sfF := float64(sfOffset) - math.Log2(float64(targetMaxIx)/math.Pow(maxAbs, 0.75))/0.1875
-	sf = int(math.Round(sfF))
-	if sf < 0 {
-		sf = 0
-	}
-	if sf > 255 {
-		sf = 255
-	}
-
-	gain := math.Pow(2, -0.1875*float64(sf-sfOffset))
-	for k, v := range spec {
-		q := int(math.Pow(math.Abs(v)*gain, 0.75) + 0.4054)
-		if q > maxQuant {
-			q = maxQuant
-		}
-		if v < 0 {
-			q = -q
-		}
-		ix[k] = q
-	}
-
-	// Highest scalefactor band containing a non-zero coefficient.
-	for sfb := len(swbWidth16) - 1; sfb >= 0; sfb-- {
-		nonzero := false
+	// Desired scalefactor per band (only for bands above the floor).
+	nb := len(swbWidth16)
+	desired := make([]int, nb)
+	active := make([]bool, nb)
+	firstActive := -1
+	for sfb := 0; sfb < nb; sfb++ {
+		var m float64
 		for k := swbOffset16[sfb]; k < swbOffset16[sfb+1]; k++ {
-			if ix[k] != 0 {
-				nonzero = true
-				break
+			if a := math.Abs(spec[k]); a > m {
+				m = a
 			}
 		}
-		if nonzero {
+		if m < floor {
+			continue
+		}
+		active[sfb] = true
+		if firstActive < 0 {
+			firstActive = sfb
+		}
+		// ix = (|xr|·2^(-0.25(sf-100)))^0.75 ; pick sf so band peak ≈ targetBandIx.
+		// => sf = 100 - log2(target / m^0.75) / 0.1875
+		desired[sfb] = clampSf(int(math.Round(
+			float64(sfOffset) - math.Log2(float64(targetBandIx)/math.Pow(m, 0.75))/0.1875)))
+	}
+	if firstActive < 0 {
+		return nil, ix, 0
+	}
+	for sfb := nb - 1; sfb >= 0; sfb-- {
+		if active[sfb] {
 			maxSfb = sfb + 1
 			break
 		}
 	}
+
+	// Assign transmitted scalefactors (DPCM deltas clamped to ±maxSfDelta so the
+	// scalefactor Huffman book can code them) and quantize each active band.
+	// Inactive bands carry the previous scalefactor (delta 0) and stay zero.
+	sf = make([]int, maxSfb)
+	prev := desired[firstActive]
+	for sfb := 0; sfb < maxSfb; sfb++ {
+		if !active[sfb] {
+			sf[sfb] = prev
+			continue
+		}
+		d := desired[sfb] - prev
+		if d < -maxSfDelta {
+			d = -maxSfDelta
+		} else if d > maxSfDelta {
+			d = maxSfDelta
+		}
+		s := prev + d
+		sf[sfb] = s
+
+		gain := math.Pow(2, -0.25*float64(s-sfOffset))
+		for k := swbOffset16[sfb]; k < swbOffset16[sfb+1]; k++ {
+			q := int(math.Pow(math.Abs(spec[k])*gain, 0.75) + 0.4054)
+			if q > maxQuant {
+				q = maxQuant
+			}
+			if spec[k] < 0 {
+				q = -q
+			}
+			ix[k] = q
+		}
+		prev = s
+	}
 	return sf, ix, maxSfb
 }
 
+func clampSf(s int) int {
+	if s < 0 {
+		return 0
+	}
+	if s > 255 {
+		return 255
+	}
+	return s
+}
+
 // encodeSCE builds a raw_data_block: one single_channel_element + END.
-func encodeSCE(sf int, ix []int, maxSfb int) []byte {
+func encodeSCE(sf []int, ix []int, maxSfb int) []byte {
 	bw := &bitWriter{}
 
 	bw.write(0, 3) // id_syn_ele = ID_SCE
 	bw.write(0, 4) // element_instance_tag
 
-	bw.write(uint32(sf), 8) // global_gain (the first scalefactor)
+	globalGain := 0
+	if maxSfb > 0 {
+		globalGain = sf[0]
+	}
+	bw.write(uint32(globalGain), 8) // global_gain (the first scalefactor)
 
 	// ics_info (long window)
-	bw.write(0, 1)                // ics_reserved_bit
-	bw.write(0, 2)                // window_sequence = ONLY_LONG_SEQUENCE
-	bw.write(0, 1)                // window_shape = sine
-	bw.write(uint32(maxSfb), 6)   // max_sfb
-	bw.write(0, 1)                // predictor_data_present
+	bw.write(0, 1)              // ics_reserved_bit
+	bw.write(0, 2)              // window_sequence = ONLY_LONG_SEQUENCE
+	bw.write(0, 1)              // window_shape = sine
+	bw.write(uint32(maxSfb), 6) // max_sfb
+	bw.write(0, 1)              // predictor_data_present
 
 	if maxSfb > 0 {
 		// section_data: one section, codebook 11, covering all maxSfb bands.
@@ -241,10 +291,13 @@ func encodeSCE(sf int, ix []int, maxSfb int) []byte {
 		}
 		bw.write(uint32(run), 5)
 
-		// scale_factor_data: every band uses the same scalefactor (= global_gain),
-		// so each DPCM delta is 0 -> book12[60].
+		// scale_factor_data: DPCM against the previous scalefactor (the first band
+		// is coded relative to global_gain, i.e. delta 0).
+		prev := globalGain
 		for sfb := 0; sfb < maxSfb; sfb++ {
-			bw.write(aacBook12[60][1], uint8(aacBook12[60][0]))
+			delta := sf[sfb] - prev // guaranteed within ±maxSfDelta by quantize
+			bw.write(aacBook12[delta+maxSfDelta][1], uint8(aacBook12[delta+maxSfDelta][0]))
+			prev = sf[sfb]
 		}
 	}
 
