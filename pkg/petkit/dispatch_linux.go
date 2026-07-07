@@ -2,7 +2,6 @@ package petkit
 
 import (
 	"encoding/binary"
-	"os"
 	"strconv"
 	"unsafe"
 
@@ -61,42 +60,18 @@ const (
 	dispatchAudioModule uint16 = 1
 	msgAudioStart       uint16 = 0x0a
 	msgAudioStop        uint16 = 0x0b
-	msgAudioFlag        uint16 = 0x0d
-	msgAudioVolume      uint16 = 0x14 // dispatch_handler_set_volume: u32 level 0-9
 	agoraSrcModule      uint16 = 7
 )
 
-// aoVolumeLevel is the speaker volume level (0-9, mapped to 0.1..1.0) we push on
-// talkback start. Override with PETKIT_AO_VOL; default 9 (full volume).
-var aoVolumeLevel = func() uint32 {
-	if v, err := strconv.Atoi(os.Getenv("PETKIT_AO_VOL")); err == nil && v >= 0 && v <= 9 {
-		return uint32(v)
-	}
-	return 9
-}()
-
-// startTalkback tells module 1 to start its speaker ring reader, exactly like
-// agora's audio watchdog. Best-effort — failures are ignored.
+// startTalkback tells module 1 to start its speaker ring reader, mirroring
+// agora exactly. Ground truth: agora_rtsa_start_audio_play sends ONLY speak_start
+// (msg 0x0a, dst 1, src 7, no payload) to open the speaker path — it never
+// touches AX_AO volume. dispatch_handler_set_volume (msg 0x14) and
+// set_mic_volume (msg 0x0d) are deliberately NOT sent: they change device
+// settings (which the app then announces with "settings updated"/cfg_update.aac)
+// and the speaker already has a working volume from /opt/dev.conf. Best-effort.
 func startTalkback() {
-	_ = dispatchSendFrom(dispatchAudioModule, msgAudioFlag, agoraSrcModule, []byte{0, 0, 0, 0})
 	_ = dispatchSendFrom(dispatchAudioModule, msgAudioStart, agoraSrcModule, nil)
-	setSpeakerVolume(aoVolumeLevel)
-}
-
-// setSpeakerVolume un-mutes the speaker. The media daemon's boot init
-// (media_arm FUN_00029380) sets AX_AO_SetVqeVolume from ao_vol in
-// /opt/dev.conf; when that key is 0 or absent the speaker is muted (volume 0.0)
-// and no PCM is audible even though frames decode fine — the reason talkback
-// stayed silent while frames were being consumed. dispatch_handler_set_volume
-// (msg 0x14, payload = u32 level 0-9) calls AX_AO_SetVqeVolume((level+1)*0.1),
-// so any level yields >= 0.1 and lifts the mute. Best-effort.
-func setSpeakerVolume(level uint32) {
-	if level > 9 {
-		level = 9
-	}
-	var payload [4]byte
-	binary.LittleEndian.PutUint32(payload[:], level)
-	_ = dispatchSendFrom(dispatchAudioModule, msgAudioVolume, agoraSrcModule, payload[:])
 }
 
 // stopTalkback tells module 1 to stop the speaker ring reader.
