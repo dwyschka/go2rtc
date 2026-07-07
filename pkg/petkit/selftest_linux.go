@@ -50,6 +50,7 @@ func SelfTestFile(path string) (err error) {
 
 	fmt.Printf("readers at start: %v (write_num=%d)\n", mb.ActiveReaders(), mb.WriteNum())
 
+	base := uint64(time.Now().UnixNano() / 1000)
 	var idx uint32
 	var ptsUs uint64
 	for i := 0; i+aac.ADTSHeaderSize <= len(data); {
@@ -60,7 +61,7 @@ func SelfTestFile(path string) (err error) {
 		if size < aac.ADTSHeaderSize || i+size > len(data) {
 			break
 		}
-		if err = mb.WriteAudioFrame(aacPayload(data[i:i+size]), ptsUs, idx); err != nil {
+		if err = mb.WriteAudioFrame(aacPayload(data[i:i+size]), base+ptsUs, idx); err != nil {
 			return err
 		}
 		i += size
