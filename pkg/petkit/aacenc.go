@@ -19,14 +19,22 @@ import (
 )
 
 // rawAAC strips the ADTS header so the ring carries raw AAC access units.
-// agora_arm on the AXERA device writes raw AAC-LC AUs (no ADTS; codec/samples
-// live in the frame descriptor), so raw is the default. Set PETKIT_AAC_ADTS=1
-// to force ADTS instead (e.g. for the older Ingenic/MIPS firmware).
-var rawAAC = os.Getenv("PETKIT_AAC_ADTS") != "1"
+//
+// Ground truth from the media daemon (media_arm, AXERA/ARM): its speaker
+// decoder — AX_ADEC channel 0, created in FUN_00029380 — is opened with
+// enTransType = 2 (TT_MP4_ADTS) and u32ConfLen = 0, i.e. it expects
+// self-describing ADTS frames with no out-of-band ASC. The working
+// notification-tone path (dispatch_handler_play_aac_file) streams full ADTS
+// frames straight into the same channel, and the "auido-out" ring reader
+// (FUN_0002914c) forwards each ring payload verbatim to AX_ADEC_SendStream. So
+// ADTS is the correct default: raw AUs never sync in the ADTS decoder, which is
+// why earlier raw frames were consumed but produced no PCM (silence).
+// Set PETKIT_AAC_RAW=1 to strip the header for firmware opened in raw mode.
+var rawAAC = os.Getenv("PETKIT_AAC_RAW") == "1"
 
-// aacPayload returns the ring payload for one encoded frame: the raw AAC AU
-// (ADTS header stripped, honoring the CRC-present length) by default, or the
-// full ADTS frame when PETKIT_AAC_ADTS=1.
+// aacPayload returns the ring payload for one encoded frame: the full ADTS
+// frame by default (what the media daemon's ADTS decoder needs), or the raw AAC
+// AU (ADTS header stripped, honoring the CRC-present length) when PETKIT_AAC_RAW=1.
 func aacPayload(adts []byte) []byte {
 	if rawAAC && aac.IsADTS(adts) {
 		if n := aac.ADTSHeaderLen(adts); len(adts) > n {

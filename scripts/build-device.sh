@@ -35,9 +35,9 @@ build() {
 # it. GOARM=6 runs on that device and every newer ARMv7.
 target="${1:-all}"
 case "$target" in
-	arm)    build armhf  arm 6 ;;
+	arm)    build armhf  arm 7 ;;
 	mipsle) build mipsle mipsle ;;
-	all)    build armhf  arm 6; build mipsle mipsle ;;
+	all)    build armhf  arm 7; build mipsle mipsle ;;
 	*) echo "unknown target: $target (use: arm | mipsle | all)"; exit 1 ;;
 esac
 
