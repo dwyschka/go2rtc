@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -68,6 +69,10 @@ var (
 	errTooSmall  = errors.New("petkit: shared memory smaller than control block")
 	errFrameSize = errors.New("petkit: frame size exceeds ring — buffer desync")
 	errTimeout   = errors.New("petkit: read frame timeout")
+	errClosed    = errors.New("petkit: shared memory ring closed")
+
+	// errAgain is an internal sentinel: nothing matched this pass, poll again.
+	errAgain = errors.New("petkit: no frame yet")
 )
 
 // MBuffer is a mapping of the camera's shared-memory media ring.
@@ -78,6 +83,14 @@ type MBuffer struct {
 	ringSize uint32    // len(ring); power of two
 	ringMask uint32    // ringSize - 1
 	mu       *shmMutex // process-shared lock at data[0]
+
+	// access guards the lifetime of the mapping itself: every operation that
+	// touches data holds it shared, Close holds it exclusively before munmap.
+	// Without this, go2rtc's Connection.Stop (which closes the Transport, i.e.
+	// unmaps us) racing a concurrent ReadFrame/Release is a SIGSEGV, not an
+	// error — the futex mutex lives inside the mapping.
+	access sync.RWMutex
+	closed bool
 }
 
 // OpenMBuffer maps the existing shared-memory ring created by the camera
@@ -135,8 +148,16 @@ func OpenMBuffer() (*MBuffer, error) {
 	return mb, nil
 }
 
-// Close unmaps the ring and closes the descriptor.
+// Close unmaps the ring and closes the descriptor. It waits for in-flight
+// operations to finish and is safe to call more than once (go2rtc calls it via
+// Connection.Stop's Transport close and again on producer teardown).
 func (mb *MBuffer) Close() error {
+	mb.access.Lock()
+	defer mb.access.Unlock()
+	if mb.closed {
+		return nil
+	}
+	mb.closed = true
 	err := unix.Munmap(mb.data)
 	if cerr := unix.Close(mb.fd); err == nil {
 		err = cerr
@@ -195,6 +216,12 @@ func (mb *MBuffer) WriteAudioFrame(aac []byte, ptsUs uint64, frameIndex uint32) 
 	size := uint32(len(aac))
 	if size+frameHdrSize > mb.ringSize {
 		return errFrameSize
+	}
+
+	mb.access.RLock()
+	defer mb.access.RUnlock()
+	if mb.closed {
+		return errClosed
 	}
 
 	if err := mb.mu.Lock(lockTimeout); err != nil {
@@ -286,6 +313,11 @@ func (mb *MBuffer) WriteAudioFrame(aac []byte, ptsUs uint64, frameIndex uint32) 
 // confirm the media daemon started its "auido-out" audio reader (filter mask
 // 0x0002) after we sent speak_start.
 func (mb *MBuffer) ActiveReaders() []string {
+	mb.access.RLock()
+	defer mb.access.RUnlock()
+	if mb.closed {
+		return []string{errClosed.Error()}
+	}
 	if err := mb.mu.Lock(lockTimeout); err != nil {
 		return []string{"lock: " + err.Error()}
 	}
@@ -309,7 +341,14 @@ func (mb *MBuffer) ActiveReaders() []string {
 
 // WriteNum returns the ring's current newest-frame sequence number, for
 // diagnostics (compare against a reader's num to see if it is keeping up).
-func (mb *MBuffer) WriteNum() uint32 { return mb.loadU32(offWriteNum) }
+func (mb *MBuffer) WriteNum() uint32 {
+	mb.access.RLock()
+	defer mb.access.RUnlock()
+	if mb.closed {
+		return 0
+	}
+	return mb.loadU32(offWriteNum)
+}
 
 // Reader is a registered consumer of the ring, mirroring tserver's "ts-server"
 // reader. last-read bookkeeping is kept process-local (the producer never reads
@@ -339,6 +378,11 @@ func (r *Reader) TakeLost() bool {
 func (mb *MBuffer) CreateReader(name string, startNewest bool) (*Reader, error) {
 	if len(name) == 0 || len(name) > readerNameMax {
 		return nil, errBadName
+	}
+	mb.access.RLock()
+	defer mb.access.RUnlock()
+	if mb.closed {
+		return nil, errClosed
 	}
 	if err := mb.mu.Lock(lockTimeout); err != nil {
 		return nil, err
@@ -392,93 +436,118 @@ func (mb *MBuffer) CreateReader(name string, startNewest bool) (*Reader, error) 
 
 // SetFilter updates which media bits this reader accepts (main/sub/audio).
 func (r *Reader) SetFilter(mask uint16) error {
-	if err := r.mb.mu.Lock(lockTimeout); err != nil {
+	mb := r.mb
+	mb.access.RLock()
+	defer mb.access.RUnlock()
+	if mb.closed {
+		return errClosed
+	}
+	if err := mb.mu.Lock(lockTimeout); err != nil {
 		return err
 	}
 	r.filter = mask
-	r.mb.storeU16(r.slotOff+slotFilterMask, mask)
-	r.mb.mu.Unlock()
+	mb.storeU16(r.slotOff+slotFilterMask, mask)
+	mb.mu.Unlock()
 	return nil
 }
 
 // Release marks the slot free so the producer stops emitting for it.
 func (r *Reader) Release() {
-	if err := r.mb.mu.Lock(lockTimeout); err != nil {
+	mb := r.mb
+	mb.access.RLock()
+	defer mb.access.RUnlock()
+	if mb.closed {
 		return
 	}
-	r.mb.storeU32(r.slotOff+slotActive, 0)
-	r.mb.mu.Unlock()
+	if err := mb.mu.Lock(lockTimeout); err != nil {
+		return
+	}
+	mb.storeU32(r.slotOff+slotActive, 0)
+	mb.mu.Unlock()
 }
 
 // ReadFrame returns the next frame matching the reader's filter, waiting up to
-// timeoutMs milliseconds. It is a direct port of libbase's mbuffer_read_frame:
-// take the shared lock, snap forward on ring loss, then scan committed frames.
+// timeoutMs milliseconds. It polls readOnce so the mapping guard is only held
+// while actually touching shared memory — a concurrent Close proceeds while we
+// sleep and turns the next pass into errClosed.
 func (r *Reader) ReadFrame(timeoutMs int) (*Frame, error) {
-	mb := r.mb
 	var deadline time.Time
 	if timeoutMs > 0 {
 		deadline = time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
 	}
 
 	for {
-		if err := mb.mu.Lock(lockTimeout); err != nil {
-			return nil, err
+		f, err := r.readOnce()
+		if err != errAgain {
+			return f, err
 		}
-
-		writeNum := mb.loadU32(offWriteNum)
-		minNum := mb.loadU32(offMinNum)
-		tailPos := mb.loadU32(offTailPos) & mb.ringMask
-		headPos := mb.loadU32(offHeadPos) & mb.ringMask
-
-		// Loss BEFORE: we fell behind the oldest available frame.
-		if int32((r.lastNum+1)-minNum) < 0 {
-			r.lastNum = minNum - 1
-			r.lastPos = tailPos
-			r.lost = true
-		}
-
-		// Loss AFTER: the ring lapped past us; nothing valid to read now.
-		if int32(writeNum-r.lastNum) < 0 {
-			r.lastNum = writeNum
-			r.lastPos = headPos
-			r.lost = true
-		} else {
-			// Scan forward over committed frames.
-			for int32(r.lastNum-writeNum) < 0 {
-				raw := mb.ringCopy(r.lastPos, frameHdrSize)
-				hdr := parseFrameHeader(raw)
-				size := binary.LittleEndian.Uint32(raw[0x04:])
-				if size == 0 || size > mb.ringSize {
-					// Corrupt/desynced size: snap to the live edge and bail.
-					r.lastNum = writeNum
-					r.lastPos = headPos
-					mb.mu.Unlock()
-					return nil, errFrameSize
-				}
-
-				if hdr.Flags&r.filter != 0 {
-					r.lastNum++
-					dataOff := (r.lastPos + frameHdrSize) & mb.ringMask
-					hdr.Data = mb.ringCopy(dataOff, size)
-					r.lastPos = (dataOff + size) & mb.ringMask
-					mb.mu.Unlock()
-					return &hdr, nil
-				}
-
-				// Not our media type: skip the whole frame.
-				r.lastNum = hdr.Num
-				r.lastPos = (r.lastPos + frameHdrSize + size) & mb.ringMask
-			}
-		}
-
-		mb.mu.Unlock()
-
-		if timeoutMs == 0 {
-			return nil, errTimeout
-		}
-		if time.Now().After(deadline) {
+		if timeoutMs == 0 || time.Now().After(deadline) {
 			return nil, errTimeout
 		}
 		time.Sleep(pollInterval)
 	}
+}
+
+// readOnce makes one scan pass over the ring. It is a direct port of libbase's
+// mbuffer_read_frame: take the shared lock, snap forward on ring loss, then
+// scan committed frames. Returns errAgain when no matching frame is committed.
+func (r *Reader) readOnce() (*Frame, error) {
+	mb := r.mb
+	mb.access.RLock()
+	defer mb.access.RUnlock()
+	if mb.closed {
+		return nil, errClosed
+	}
+
+	if err := mb.mu.Lock(lockTimeout); err != nil {
+		return nil, err
+	}
+	defer mb.mu.Unlock()
+
+	writeNum := mb.loadU32(offWriteNum)
+	minNum := mb.loadU32(offMinNum)
+	tailPos := mb.loadU32(offTailPos) & mb.ringMask
+	headPos := mb.loadU32(offHeadPos) & mb.ringMask
+
+	// Loss BEFORE: we fell behind the oldest available frame.
+	if int32((r.lastNum+1)-minNum) < 0 {
+		r.lastNum = minNum - 1
+		r.lastPos = tailPos
+		r.lost = true
+	}
+
+	// Loss AFTER: the ring lapped past us; nothing valid to read now.
+	if int32(writeNum-r.lastNum) < 0 {
+		r.lastNum = writeNum
+		r.lastPos = headPos
+		r.lost = true
+		return nil, errAgain
+	}
+
+	// Scan forward over committed frames.
+	for int32(r.lastNum-writeNum) < 0 {
+		raw := mb.ringCopy(r.lastPos, frameHdrSize)
+		hdr := parseFrameHeader(raw)
+		size := binary.LittleEndian.Uint32(raw[0x04:])
+		if size == 0 || size > mb.ringSize {
+			// Corrupt/desynced size: snap to the live edge and bail.
+			r.lastNum = writeNum
+			r.lastPos = headPos
+			return nil, errFrameSize
+		}
+
+		if hdr.Flags&r.filter != 0 {
+			r.lastNum++
+			dataOff := (r.lastPos + frameHdrSize) & mb.ringMask
+			hdr.Data = mb.ringCopy(dataOff, size)
+			r.lastPos = (dataOff + size) & mb.ringMask
+			return &hdr, nil
+		}
+
+		// Not our media type: skip the whole frame.
+		r.lastNum = hdr.Num
+		r.lastPos = (r.lastPos + frameHdrSize + size) & mb.ringMask
+	}
+
+	return nil, errAgain
 }

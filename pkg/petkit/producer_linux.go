@@ -244,6 +244,9 @@ func (p *Producer) Start() (err error) {
 				p.needKey = true
 				continue
 			}
+			if errors.Is(err, errClosed) {
+				return nil // deliberate Stop unmapped the ring — clean exit
+			}
 			return err
 		}
 
@@ -310,9 +313,10 @@ func (p *Producer) writeAudio(f *Frame) {
 	}
 }
 
-// Stop releases the reader slot and unmaps the shared memory.
+// Stop releases the reader slot and unmaps the shared memory. The petkit
+// teardown must run BEFORE Connection.Stop: that closes the Transport (our
+// MBuffer), and the EOS frame + reader-slot release need the live mapping.
 func (p *Producer) Stop() error {
-	err := p.Connection.Stop()
 	if p.sender != nil {
 		p.sender.Close()
 		// End-of-stream marker + tell module 1 to stop its speaker reader.
@@ -322,7 +326,7 @@ func (p *Producer) Stop() error {
 	if p.reader != nil {
 		p.reader.Release()
 	}
-	return err
+	return p.Connection.Stop()
 }
 
 // nowRTP returns a monotonic RTP timestamp for the given clock rate, derived
