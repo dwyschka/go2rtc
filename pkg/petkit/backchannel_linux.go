@@ -28,6 +28,9 @@ func (p *Producer) AddTrack(media *core.Media, _ *core.Codec, track *core.Receiv
 		p.pcmBuf = p.pcmBuf[:0]
 		p.sender = core.NewSender(media, track.Codec)
 		p.sender.Handler = p.handleTalkbackRTP
+		// Register on the connection so /api/streams shows the talkback
+		// sender's packets/drops (drops > 0 = encoder slower than real time).
+		p.Senders = append(p.Senders, p.sender)
 	}
 	p.sender.HandleRTP(track)
 	return nil

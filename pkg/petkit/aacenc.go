@@ -2,11 +2,13 @@ package petkit
 
 // AAC-LC encoder for the talkback backchannel: 16 kHz mono PCM -> ADTS-AAC-LC.
 //
-// A single_channel_element with a long (1024) window, one global scalefactor,
+// A single_channel_element with a long (1024) window, per-band scalefactors,
 // and spectral codebook 11 (HCB_ESC) for every band. No psychoacoustic model —
 // uniform quantization, which is plenty for intelligible voice. The Huffman
 // tables (aac_tables.go) and the cb11 pair/escape coding are the ISO/IEC
-// 14496-3 tables/algorithm reproduced from the FAAC reference.
+// 14496-3 tables/algorithm reproduced from the FAAC reference. The MDCT runs
+// in O(N log N) via a 512-point complex FFT — the camera's ARM core cannot
+// sustain the textbook O(N²) form in real time (see aacenc_mdct_test.go).
 //
 // Pure Go, no OS dependencies, so it is unit-testable on any platform.
 
@@ -65,9 +67,20 @@ var swbWidth16 = []int{
 // swbOffset16[i] = start spectral line of scalefactor band i (last entry = 1024).
 var swbOffset16 []int
 
+// The MDCT is evaluated as: fold the 2N-sample window into an N-point DCT-IV,
+// then compute that DCT-IV with one N/2-point complex FFT plus pre/post
+// rotations.
+const (
+	dct4Len = aacFrameSamples // N: DCT-IV length after folding the 2N window
+	fftLen  = dct4Len / 2     // P: complex FFT size driving the DCT-IV
+)
+
 var (
-	mdctWindow [mdctLen]float64 // sine analysis window
-	mdctCos    [8192]float64    // cos(pi*i/4096) lookup for the direct MDCT
+	mdctWindow [mdctLen]float64        // sine analysis window
+	fftTwid    [fftLen / 2]complex128  // e^(-j2πk/P) DFT twiddles
+	preTwid    [fftLen]complex128      // e^(-jπi/N) DCT-IV pre-rotation
+	postTwid   [fftLen]complex128      // e^(-jπ(4r+1)/(4N)) DCT-IV post-rotation
+	bitrev     [fftLen]int             // FFT input permutation
 )
 
 func init() {
@@ -78,9 +91,22 @@ func init() {
 	for n := 0; n < mdctLen; n++ {
 		mdctWindow[n] = math.Sin(math.Pi / (2 * mdctLen) * (float64(n) + 0.5))
 	}
-	for i := range mdctCos {
-		mdctCos[i] = math.Cos(math.Pi * float64(i) / 4096)
+	for k := range fftTwid {
+		fftTwid[k] = expJ(-2 * math.Pi * float64(k) / fftLen)
 	}
+	for i := range preTwid {
+		preTwid[i] = expJ(-math.Pi * float64(i) / dct4Len)
+		postTwid[i] = expJ(-math.Pi * float64(4*i+1) / (4 * dct4Len))
+	}
+	log2n := bits.Len(uint(fftLen)) - 1
+	for i := range bitrev {
+		bitrev[i] = int(bits.Reverse16(uint16(i)) >> (16 - log2n))
+	}
+}
+
+// expJ returns e^(jθ).
+func expJ(theta float64) complex128 {
+	return complex(math.Cos(theta), math.Sin(theta))
 }
 
 func sampleRateIndex(rate int) byte {
@@ -149,17 +175,48 @@ func (e *aacEncoder) EncodeFrame(pcm []int16) []byte {
 	return e.addADTS(raw)
 }
 
-// mdct computes X[k] = Σ x[n]·cos[(π/N)(n+½+N/2)(k+½)], N=1024, via a lookup
-// table so the hot loop has no transcendental calls.
+// mdct computes X[k] = Σ x[n]·cos[(π/2N)(2n+1+N/2)(2k+1)], the 2048-input /
+// 1024-output forward MDCT. The direct form (kept as mdctDirect in the tests)
+// needs ~2M float64 MACs per 64 ms frame — more than the camera's ARM core can
+// sustain, which backs audio up in the sender queue as seconds of latency.
+// This evaluates the same transform in O(N log N).
 func mdct(x, out []float64) {
-	for k := 0; k < aacFrameSamples; k++ {
-		k2 := 2*k + 1
-		var sum float64
-		for n := 0; n < mdctLen; n++ {
-			idx := ((2*n + 1 + aacFrameSamples) * k2) & 8191
-			sum += x[n] * mdctCos[idx]
+	const q = mdctLen / 4 // window quarter (a|b|c|d), 512 samples
+
+	// Boundary folding: MDCT(a,b,c,d) = DCT-IV(-c_R - d, a - b_R).
+	var u [dct4Len]float64
+	for j := 0; j < q; j++ {
+		u[j] = -x[3*q-1-j] - x[3*q+j]
+		u[q+j] = x[j] - x[2*q-1-j]
+	}
+
+	// DCT-IV via one P-point FFT: pair samples from both ends into complex
+	// values, pre-rotate, transform, post-rotate, deinterleave.
+	var z [fftLen]complex128
+	for i := 0; i < fftLen; i++ {
+		z[bitrev[i]] = complex(u[2*i], u[dct4Len-1-2*i]) * preTwid[i]
+	}
+	fftInPlace(z[:])
+	for r := 0; r < fftLen; r++ {
+		w := z[r] * postTwid[r]
+		out[2*r] = real(w)
+		out[dct4Len-1-2*r] = -imag(w)
+	}
+}
+
+// fftInPlace is an iterative radix-2 DIT FFT; input must already be in
+// bit-reversed order (callers index through bitrev).
+func fftInPlace(z []complex128) {
+	n := len(z)
+	for size := 2; size <= n; size <<= 1 {
+		half, step := size>>1, n/size
+		for base := 0; base < n; base += size {
+			for i := 0; i < half; i++ {
+				t := z[base+half+i] * fftTwid[i*step]
+				z[base+half+i] = z[base+i] - t
+				z[base+i] += t
+			}
 		}
-		out[k] = sum
 	}
 }
 
