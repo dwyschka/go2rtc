@@ -60,14 +60,17 @@ const (
 	dispatchAudioModule uint16 = 1
 	msgAudioStart       uint16 = 0x0a
 	msgAudioStop        uint16 = 0x0b
-	msgAudioFlag        uint16 = 0x0d
 	agoraSrcModule      uint16 = 7
 )
 
-// startTalkback tells module 1 to start its speaker ring reader, exactly like
-// agora's audio watchdog. Best-effort — failures are ignored.
+// startTalkback tells module 1 to start its speaker ring reader, mirroring
+// agora exactly. Ground truth: agora_rtsa_start_audio_play sends ONLY speak_start
+// (msg 0x0a, dst 1, src 7, no payload) to open the speaker path — it never
+// touches AX_AO volume. dispatch_handler_set_volume (msg 0x14) and
+// set_mic_volume (msg 0x0d) are deliberately NOT sent: they change device
+// settings (which the app then announces with "settings updated"/cfg_update.aac)
+// and the speaker already has a working volume from /opt/dev.conf. Best-effort.
 func startTalkback() {
-	_ = dispatchSendFrom(dispatchAudioModule, msgAudioFlag, agoraSrcModule, []byte{0, 0, 0, 0})
 	_ = dispatchSendFrom(dispatchAudioModule, msgAudioStart, agoraSrcModule, nil)
 }
 
