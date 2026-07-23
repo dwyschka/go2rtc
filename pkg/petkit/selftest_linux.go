@@ -35,7 +35,7 @@ func SelfTestFile(path string) (err error) {
 	frameDur := time.Duration(aacFrameSamples) * time.Second / time.Duration(rate)
 	fmt.Printf("playing %s: %d bytes, %d Hz, frame=%v\n", path, len(data), rate, frameDur)
 
-	mb, err := OpenMBuffer()
+	mb, err := openMBufferAuto()
 	if err != nil {
 		return err
 	}
@@ -91,7 +91,7 @@ func TalkbackDiag() {
 
 	log("euid=%d (root=%v)", os.Geteuid(), os.Geteuid() == 0)
 
-	mb, err := OpenMBuffer()
+	mb, err := openMBufferAuto()
 	if err != nil {
 		log("shm /media_buffer_frame_buf: FAIL — %v", err)
 		return
@@ -159,7 +159,7 @@ func SelfTestTone(dur time.Duration, freqHz float64) (err error) {
 		freqHz = 1000
 	}
 
-	mb, err := OpenMBuffer()
+	mb, err := openMBufferAuto()
 	if err != nil {
 		return err
 	}

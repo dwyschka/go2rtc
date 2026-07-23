@@ -18,13 +18,15 @@ const shmPath = "/dev/shm/media_buffer_frame_buf"
 
 // Fixed layout constants (identical across the MIPS and ARM builds — they are
 // application-level, not kernel-ABI, values).
+//
+// The per-frame descriptor size is NOT here — it differs by firmware (0x38 on
+// ARM, 0x35 on Ingenic-T7) and lives in frameLayout (layout.go).
 const (
-	ctrlSize     = 0x3e8 // control block size; ring data begins here
-	frameHdrSize = 0x38  // per-frame header size within the ring
-	slotSize     = 0x2c  // reader slot size
-	slotCount    = 20    // number of reader slots
-	slotArrayOff = 0x2c  // control-block offset of the reader-slot array
-	readerNameMax = 15   // max reader name length (strncpy(name, 0xf))
+	ctrlSize      = 0x3e8 // control block size; ring data begins here
+	slotSize      = 0x2c  // reader slot size
+	slotCount     = 20    // number of reader slots
+	slotArrayOff  = 0x2c  // control-block offset of the reader-slot array
+	readerNameMax = 15    // max reader name length (strncpy(name, 0xf))
 )
 
 // Control-block field offsets (all uint32 unless noted).
@@ -78,11 +80,12 @@ var (
 // MBuffer is a mapping of the camera's shared-memory media ring.
 type MBuffer struct {
 	fd       int
-	data     []byte    // full mmap: control block + ring
-	ring     []byte    // data[ctrlSize:]
-	ringSize uint32    // len(ring); power of two
-	ringMask uint32    // ringSize - 1
-	mu       *shmMutex // process-shared lock at data[0]
+	data     []byte      // full mmap: control block + ring
+	ring     []byte      // data[ctrlSize:]
+	ringSize uint32      // len(ring); power of two
+	ringMask uint32      // ringSize - 1
+	mu       *shmMutex   // process-shared lock at data[0]
+	layout   frameLayout // per-firmware frame-descriptor field offsets
 
 	// access guards the lifetime of the mapping itself: every operation that
 	// touches data holds it shared, Close holds it exclusively before munmap.
@@ -95,7 +98,8 @@ type MBuffer struct {
 
 // OpenMBuffer maps the existing shared-memory ring created by the camera
 // pipeline. It does not create the object — the pipeline owns its lifecycle.
-func OpenMBuffer() (*MBuffer, error) {
+// layout selects the per-firmware frame-descriptor field offsets.
+func OpenMBuffer(layout frameLayout) (*MBuffer, error) {
 	fd, err := unix.Open(shmPath, unix.O_RDWR, 0)
 	if err != nil {
 		if err == unix.EACCES {
@@ -144,8 +148,20 @@ func OpenMBuffer() (*MBuffer, error) {
 		ringSize: ringSize,
 		ringMask: ringSize - 1,
 		mu:       newShmMutex(data),
+		layout:   layout,
 	}
 	return mb, nil
+}
+
+// openMBufferAuto maps the ring using the layout from the PETKIT_LAYOUT env var
+// (default ARM). Convenience for the self-test / diagnostic entry points that
+// have no petkit:// URL to carry a ?layout= query.
+func openMBufferAuto() (*MBuffer, error) {
+	layout, err := resolveLayout("")
+	if err != nil {
+		return nil, err
+	}
+	return OpenMBuffer(layout)
 }
 
 // Close unmaps the ring and closes the descriptor. It waits for in-flight
@@ -213,8 +229,9 @@ func (mb *MBuffer) ringWrite(off uint32, src []byte) {
 // A nil/empty payload writes a header-only frame, which the media daemon reads
 // as the end-of-stream marker (matches agora's save_audio_out_stop_frame).
 func (mb *MBuffer) WriteAudioFrame(aac []byte, ptsUs uint64, frameIndex uint32) error {
+	hdrSz := uint32(mb.layout.hdrSize)
 	size := uint32(len(aac))
-	if size+frameHdrSize > mb.ringSize {
+	if size+hdrSz > mb.ringSize {
 		return errFrameSize
 	}
 
@@ -241,45 +258,49 @@ func (mb *MBuffer) WriteAudioFrame(aac []byte, ptsUs uint64, frameIndex uint32) 
 	}
 
 	// Evict oldest frames until the new one fits.
-	for size+frameHdrSize+dataLen > mb.ringSize {
-		raw := mb.ringCopy(tailPos, frameHdrSize)
-		oldSize := binary.LittleEndian.Uint32(raw[0x04:])
-		oldNum := binary.LittleEndian.Uint32(raw[0x00:])
-		if dataLen < oldSize+frameHdrSize || oldNum != minNum {
+	for size+hdrSz+dataLen > mb.ringSize {
+		raw := mb.ringCopy(tailPos, hdrSz)
+		oldSize := leU32(raw, mb.layout.offSize)
+		oldNum := leU32(raw, mb.layout.offNum)
+		if dataLen < oldSize+hdrSz || oldNum != minNum {
 			// Ring inconsistent — reset to empty.
 			writeNum, minNum, dataLen, tailPos, headPos = 0, 0, 0, 0, 0
 			break
 		}
-		tailPos = (tailPos + oldSize + frameHdrSize) & mb.ringMask
-		dataLen -= oldSize + frameHdrSize
+		tailPos = (tailPos + oldSize + hdrSz) & mb.ringMask
+		dataLen -= oldSize + hdrSz
 		minNum = oldNum + 1
 	}
 
 	writeNum++
-	// Frame descriptor filled exactly like agora's __on_audio_data (the app's
-	// proven talkback writer): audio frames carry a codec tag + sample-count so
-	// the media daemon configures its decoder correctly.
-	var hdr [frameHdrSize]byte
-	binary.LittleEndian.PutUint32(hdr[0x00:], writeNum)              // num
-	binary.LittleEndian.PutUint32(hdr[0x04:], size)                  // size
-	binary.LittleEndian.PutUint32(hdr[0x0c:], uint32(time.Now().Unix())) // wall sec
-	binary.LittleEndian.PutUint64(hdr[0x10:], ptsUs)                 // pts (us)
-	binary.LittleEndian.PutUint64(hdr[0x18:], ptsUs)                 // local capture (us)
-	hdr[0x20] = 0                                                    // frame_type
-	hdr[0x21] = 4                                                    // codec = AAC
-	binary.LittleEndian.PutUint16(hdr[0x22:], audioOutType)          // type_flags = 0x0002
-	binary.LittleEndian.PutUint16(hdr[0x2e:], 0x0400)               // 1024 samples/frame (AAC-LC)
-	binary.LittleEndian.PutUint16(hdr[0x30:], 0x0010)               // 16 (kHz/bit)
+	// Frame descriptor filled per the active firmware layout. On ARM this mirrors
+	// agora's __on_audio_data (num/size/pts/capture + codec tag + sample-count so
+	// the media daemon configures its AAC decoder); on Ingenic-T7 the descriptor
+	// is smaller and the codec/sample fields are absent (set to -1 in the layout)
+	// and therefore skipped. audioOutType is written at the layout's type_flags
+	// offset so the media daemon's "auido-out" reader filters us in.
+	l := mb.layout
+	hdr := make([]byte, hdrSz)
+	putU32(hdr, l.offNum, writeNum)
+	putU32(hdr, l.offSize, size)
+	putU32(hdr, l.offWallSec, uint32(time.Now().Unix()))
+	putU64(hdr, l.offPTS, ptsUs)
+	putU64(hdr, l.offCaptureUS, ptsUs)
+	putByte(hdr, l.offType, 0)  // frame_type: not a video keyframe
+	putByte(hdr, l.offCodec, 4) // codec = AAC
+	putU16(hdr, l.offFlags, audioOutType)
+	putU16(hdr, l.offSamples, 0x0400) // 1024 samples/frame (AAC-LC)
+	putU16(hdr, l.offKHz, 0x0010)     // 16 (kHz/bit)
 	_ = frameIndex
 
 	if dataLen == 0 {
 		minNum = writeNum
 	}
-	mb.ringWrite(headPos, hdr[:])
-	headPos = (headPos + frameHdrSize) & mb.ringMask
+	mb.ringWrite(headPos, hdr)
+	headPos = (headPos + hdrSz) & mb.ringMask
 	mb.ringWrite(headPos, aac)
 	headPos = (headPos + size) & mb.ringMask
-	dataLen += size + frameHdrSize
+	dataLen += size + hdrSz
 
 	mb.storeU32(offWriteNum, writeNum)
 	mb.storeU32(offMinNum, minNum)
@@ -525,10 +546,11 @@ func (r *Reader) readOnce() (*Frame, error) {
 	}
 
 	// Scan forward over committed frames.
+	hdrSz := uint32(mb.layout.hdrSize)
 	for int32(r.lastNum-writeNum) < 0 {
-		raw := mb.ringCopy(r.lastPos, frameHdrSize)
-		hdr := parseFrameHeader(raw)
-		size := binary.LittleEndian.Uint32(raw[0x04:])
+		raw := mb.ringCopy(r.lastPos, hdrSz)
+		hdr := mb.layout.parseFrame(raw)
+		size := leU32(raw, mb.layout.offSize)
 		if size == 0 || size > mb.ringSize {
 			// Corrupt/desynced size: snap to the live edge and bail.
 			r.lastNum = writeNum
@@ -538,7 +560,7 @@ func (r *Reader) readOnce() (*Frame, error) {
 
 		if hdr.Flags&r.filter != 0 {
 			r.lastNum++
-			dataOff := (r.lastPos + frameHdrSize) & mb.ringMask
+			dataOff := (r.lastPos + hdrSz) & mb.ringMask
 			hdr.Data = mb.ringCopy(dataOff, size)
 			r.lastPos = (dataOff + size) & mb.ringMask
 			return &hdr, nil
@@ -546,7 +568,7 @@ func (r *Reader) readOnce() (*Frame, error) {
 
 		// Not our media type: skip the whole frame.
 		r.lastNum = hdr.Num
-		r.lastPos = (r.lastPos + frameHdrSize + size) & mb.ringMask
+		r.lastPos = (r.lastPos + hdrSz + size) & mb.ringMask
 	}
 
 	return nil, errAgain

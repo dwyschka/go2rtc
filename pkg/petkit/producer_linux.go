@@ -83,7 +83,7 @@ func Dial(source string) (core.Producer, error) {
 		return nil, err
 	}
 
-	mb, err := OpenMBuffer()
+	mb, err := OpenMBuffer(cfg.layout)
 	if err != nil {
 		return nil, err
 	}
@@ -203,14 +203,17 @@ func (p *Producer) probe() (err error) {
 
 	// Talkback backchannel: advertise that we accept G.711 A-law audio to play
 	// on the camera speaker. Browsers negotiate PCMA directly over WebRTC, which
-	// avoids needing an Opus decoder on the device.
-	p.Medias = append(p.Medias, &core.Media{
-		Kind:      core.KindAudio,
-		Direction: core.DirectionSendonly,
-		Codecs: []*core.Codec{
-			{Name: core.CodecPCMA, ClockRate: 8000, PayloadType: 8},
-		},
-	})
+	// avoids needing an Opus decoder on the device. Skipped when the device has
+	// no speaker (e.g. the mic-only Ingenic-T7) so no dead talk button appears.
+	if p.cfg.talkback {
+		p.Medias = append(p.Medias, &core.Media{
+			Kind:      core.KindAudio,
+			Direction: core.DirectionSendonly,
+			Codecs: []*core.Codec{
+				{Name: core.CodecPCMA, ClockRate: 8000, PayloadType: 8},
+			},
+		})
+	}
 
 	return nil
 }

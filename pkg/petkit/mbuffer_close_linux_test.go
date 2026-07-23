@@ -30,7 +30,7 @@ func TestMBufferCloseDuringConcurrentAccess(t *testing.T) {
 	_ = f.Close()
 	defer os.Remove(shmPath)
 
-	mb, err := OpenMBuffer()
+	mb, err := OpenMBuffer(layoutARM)
 	if err != nil {
 		t.Fatalf("OpenMBuffer: %v", err)
 	}
