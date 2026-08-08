@@ -223,9 +223,9 @@ func (mb *MBuffer) ringWrite(off uint32, src []byte) {
 // We are a second writer on the same ring the camera uses for video; the shared
 // mutex serialises us with it, and video readers skip our frames by media-type.
 //
-// The media reader wakes on its own 500 ms poll, so no semaphore post is needed
-// for continuous audio (only the very first frame after an idle gap can incur up
-// to 500 ms latency).
+// The media reader parks in sem_timedwait (500 ms timeout), so we post its
+// semaphore on every frame to wake it immediately — see the wake loop below for
+// why the post must NOT be gated on want_wakeup (lost-wakeup -> steady lag).
 // A nil/empty payload writes a header-only frame, which the media daemon reads
 // as the end-of-stream marker (matches agora's save_audio_out_stop_frame).
 func (mb *MBuffer) WriteAudioFrame(aac []byte, ptsUs uint64, frameIndex uint32) error {
@@ -308,9 +308,23 @@ func (mb *MBuffer) WriteAudioFrame(aac []byte, ptsUs uint64, frameIndex uint32) 
 	mb.storeU32(offTailPos, tailPos)
 	mb.storeU32(offHeadPos, headPos)
 
-	// Wake any reader parked in sem_timedwait whose filter matches this frame
-	// (mirrors mbuffer_write_frame's per-slot wake loop). Without this the media
-	// daemon's "auido-out" reader stays asleep and never plays our audio.
+	// Wake the media daemon's "auido-out" reader for every audio frame, filter
+	// match only — do NOT gate on want_wakeup. The daemon parks in
+	// sem_timedwait with a 500 ms timeout; the want_wakeup flag is a lost-wakeup
+	// waiting to happen for continuous talkback:
+	//
+	//   reader: ring empty -> want_wakeup=1 -> sem_timedwait(500ms)
+	//   writer: we wrote a frame in the window *before* want_wakeup was set, saw
+	//           it 0, skipped the post -> reader sleeps out the full 500 ms even
+	//           though its frame is already committed.
+	//
+	// That race is exactly the perceived talkback lag: every frame we lose the
+	// wake to it costs up to 500 ms (avg ~250 ms) of steady latency. Posting
+	// unconditionally closes the window — semPost is a counting semaphore, so if
+	// the reader is not parked (nwaiters==0) it only bumps the token count (no
+	// FUTEX_WAKE) and the reader consumes that token on its next sem_wait,
+	// draining the frame immediately instead of after the timeout. We still
+	// clear want_wakeup so a want_wakeup-honoring reader sees a clean handshake.
 	for i := 0; i < slotCount; i++ {
 		base := slotArrayOff + i*slotSize
 		if mb.loadU32(base+slotActive) == 0 {
@@ -320,11 +334,8 @@ func (mb *MBuffer) WriteAudioFrame(aac []byte, ptsUs uint64, frameIndex uint32) 
 		if mask&audioOutType == 0 {
 			continue
 		}
-		if mb.loadU32(base+slotWantWakeup) == 0 {
-			continue
-		}
 		idx := binary.LittleEndian.Uint16(mb.data[base+slotIndex:])
-		mb.storeU32(base+slotWantWakeup, 0) // clear the gate before posting
+		mb.storeU32(base+slotWantWakeup, 0) // clear the gate; we post regardless
 		semPost(idx)
 	}
 	return nil
