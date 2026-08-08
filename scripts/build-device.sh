@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Build the minimal on-device go2rtc for Petkit cameras (petkit source +
-# RTSP/WebRTC/HLS/MP4/MJPEG outputs only). Strips debug info to shrink the
-# binary. No UPX — its self-extracting stub segfaults on some ARM kernels.
+# RTSP/WebRTC/HLS/MP4/MJPEG outputs only). Strips debug info, then UPX-packs
+# with upx v4 (host binary if present, else a pinned Docker image) — see
+# maybe_compress for why the version and platform gating matters.
 #
 # Usage:
 #   scripts/build-device.sh            # build armhf + mipsle into dist/
@@ -47,11 +48,25 @@ export GOTOOLCHAIN="${DEVICE_GOTOOLCHAIN:-go1.24.13}"
 #
 # UPX VERSION MATTERS: upx >= 5.x emits a mipsel decompressor stub that uses a
 # MIPS32r2 instruction the Ingenic XBurst r1 core traps on ("Trace/breakpoint
-# trap" before Go even starts). upx 4.2.x (what upstream go2rtc packed with) is
-# r1-safe. To stay deterministic regardless of the host's upx version, we ALWAYS
-# pack inside a cached Docker image pinned to upx-ucl 4.2.x. Skip with NO_UPX=1;
-# if Docker is unavailable the binary ships uncompressed.
+# trap" before Go even starts). upx 4.x (what upstream go2rtc packed with) is
+# r1-safe, so v4 is the only version we accept. Two ways to get it, in order:
+#   1. a host-installed `upx` whose major version is 4 — no Docker needed;
+#   2. otherwise a cached Docker image pinned to upx-ucl 4.2.x.
+# A host upx that is NOT v4 (e.g. distro-shipped 5.x) is deliberately ignored so
+# it can never produce an r1-unsafe binary. Skip entirely with NO_UPX=1; if
+# neither route is available the binary ships uncompressed.
 UPX_IMAGE="go2rtc-upx:4"
+
+# upx_version prints the major.minor of an `upx` on PATH (empty if none).
+upx_version() {
+	command -v upx >/dev/null 2>&1 || return 0
+	upx --version 2>/dev/null | awk 'NR==1{print $2}'
+}
+
+# host_upx_v4 succeeds when a host `upx` is major version 4 (r1-safe).
+host_upx_v4() {
+	case "$(upx_version)" in 4.*) return 0 ;; *) return 1 ;; esac
+}
 
 upx_image_ready() {
 	docker image inspect "$UPX_IMAGE" >/dev/null 2>&1 && return 0
@@ -72,8 +87,21 @@ maybe_compress() {
 	esac
 	[ "${NO_UPX:-0}" = "1" ] && { echo "   (upx skipped: NO_UPX=1)"; return 0; }
 
+	# 1. Host upx v4 — fastest, no container.
+	if host_upx_v4; then
+		echo "   (packing with host upx $(upx_version) — r1-safe v4)"
+		( cd "$OUT" && upx --best --lzma -q "$(basename "$bin")" >/dev/null \
+			&& upx -t "$(basename "$bin")" >/dev/null ) \
+			|| { echo "!! host upx failed for $bin" >&2; exit 1; }
+		return 0
+	fi
+	if [ -n "$(upx_version)" ]; then
+		echo "   (host upx $(upx_version) is not v4 — ignoring, not r1-safe; trying Docker)"
+	fi
+
+	# 2. Pinned Docker image with upx-ucl 4.2.x.
 	if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
-		echo "   (Docker unavailable — shipping uncompressed; set NO_UPX=1 to silence)"
+		echo "   (no upx v4 on host and Docker unavailable — shipping uncompressed; set NO_UPX=1 to silence)"
 		return 0
 	fi
 

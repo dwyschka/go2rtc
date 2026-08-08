@@ -256,7 +256,10 @@ Ingenic XBurst **r1** core traps on ("Trace/breakpoint trap"); pack inside a
 cached Docker image pinned to `upx-ucl` 4.2.x (r1-safe). MIPS only; `NO_UPX=1`
 skips; ships uncompressed if Docker is absent. 13 → 3 MB. Later `UPX_ARM=1`
 opt-in added to also pack armhf (safe on the newer w7h kernel, still skipped for
-the older AXERA whose kernel segfaults on the stub).
+the older AXERA whose kernel segfaults on the stub). A host-installed `upx` is
+also used directly **only when its major version is 4** (r1-safe) — no Docker
+needed; a host `upx` 5.x is ignored (its mipsel stub traps the r1 core) and the
+build falls back to the pinned 4.2.x image.
 
 **Real-time timestamps in file playback test**
 *(`f3a8ce2`, 2026-07-07, `fix`)*
