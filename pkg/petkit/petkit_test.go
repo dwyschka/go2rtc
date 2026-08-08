@@ -84,7 +84,7 @@ func buildFrame(l frameLayout, num, index uint32, pts uint64, typ uint8, flags, 
 }
 
 func TestParseFrameHeader(t *testing.T) {
-	for _, l := range []frameLayout{layoutARM, layoutT7} {
+	for _, l := range []frameLayout{layoutARM, layoutT7, layoutW7H} {
 		t.Run(l.name, func(t *testing.T) {
 			h := buildFrame(l, 42, 7, 123_456_789, 1, mediaMain, 24, 6)
 			f := l.parseFrame(h)
@@ -111,6 +111,22 @@ func TestLayoutOffsetsMatchRE(t *testing.T) {
 	if layoutT7.offCodec != -1 || layoutT7.offSamples != -1 || layoutT7.offCaptureUS != -1 {
 		t.Errorf("T7 layout should not carry ARM-only write fields: %+v", layoutT7)
 	}
+	// w7h (ARM v8): read side from tserver_w7h (0x3D descriptor, ARM-identical
+	// through type_flags@0x22, whole tail shifted +5 -> SPS/PPS @0x37/0x39);
+	// write side pinned from agora_w7h __on_audio_data (codec@0x21, and the AAC
+	// sample hints samples@0x33 / khz@0x35, also +5 from ARM's 0x2e/0x30). Has a
+	// speaker -> talkback.
+	if layoutW7H.hdrSize != 0x3d || layoutW7H.offType != 0x20 || layoutW7H.offFlags != 0x22 ||
+		layoutW7H.offSPS != 0x37 || layoutW7H.offPPS != 0x39 {
+		t.Errorf("w7h layout drifted: %+v", layoutW7H)
+	}
+	if !layoutW7H.speaker || layoutW7H.offCodec != 0x21 || layoutW7H.offCaptureUS != 0x18 ||
+		layoutW7H.offWallSec != 0x0c {
+		t.Errorf("w7h layout should be speaker-capable with ARM-front write fields: %+v", layoutW7H)
+	}
+	if layoutW7H.offSamples != 0x33 || layoutW7H.offKHz != 0x35 {
+		t.Errorf("w7h AAC sample hints must match agora_w7h __on_audio_data (+5 from ARM): %+v", layoutW7H)
+	}
 }
 
 func TestSelectLayout(t *testing.T) {
@@ -121,6 +137,9 @@ func TestSelectLayout(t *testing.T) {
 		"t7":      "t7",
 		"mips":    "t7",
 		"Ingenic": "t7",
+		"w7h":     "w7h",
+		"W7H":     "w7h",
+		"w7":      "w7h",
 	}
 	for in, want := range cases {
 		l, err := selectLayout(in)

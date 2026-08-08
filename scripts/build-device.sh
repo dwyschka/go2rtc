@@ -39,9 +39,11 @@ export GOTOOLCHAIN="${DEVICE_GOTOOLCHAIN:-go1.24.13}"
 #     back for that target only.
 
 # UPX-compress a built binary in place (~4x smaller — matters on the device's
-# tiny flash). MIPS ONLY: the upstream go2rtc mipsle release is UPX+LZMA and
-# runs on the Petkit T7 unchanged, so the self-extractor is fine here. NOT for
-# ARM — its UPX stub segfaults on that kernel (leave armhf uncompressed).
+# tiny flash). MIPS ONLY by default: the upstream go2rtc mipsle release is
+# UPX+LZMA and runs on the Petkit T7 unchanged, so the self-extractor is fine
+# there. ARM is skipped by default because the OLDER AXERA/D4SH kernel segfaults
+# on the UPX stub — but the newer w7h (ARM v8) unit handles it, so set UPX_ARM=1
+# to also pack the armhf binary (still via the r1-safe upx 4.2.x image).
 #
 # UPX VERSION MATTERS: upx >= 5.x emits a mipsel decompressor stub that uses a
 # MIPS32r2 instruction the Ingenic XBurst r1 core traps on ("Trace/breakpoint
@@ -63,7 +65,11 @@ upx_image_ready() {
 
 maybe_compress() {
 	local bin="$1" goarch="$2"
-	case "$goarch" in mips*) ;; *) return 0 ;; esac
+	case "$goarch" in
+		mips*) ;;
+		arm*) [ "${UPX_ARM:-0}" = "1" ] || return 0 ;;
+		*) return 0 ;;
+	esac
 	[ "${NO_UPX:-0}" = "1" ] && { echo "   (upx skipped: NO_UPX=1)"; return 0; }
 
 	if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
