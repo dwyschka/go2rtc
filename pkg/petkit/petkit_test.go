@@ -204,6 +204,83 @@ func TestParseSourceTalkback(t *testing.T) {
 	}
 }
 
+func TestParseSourceSnapshot(t *testing.T) {
+	// Native JPEG snapshots are advertised by default.
+	if cfg, err := parseSource("petkit://main"); err != nil || !cfg.snapshot {
+		t.Fatalf("default snapshot: got %v, %v", cfg.snapshot, err)
+	}
+	// ?snapshot=0 hides the JPEG track.
+	if cfg, err := parseSource("petkit://main?snapshot=0"); err != nil || cfg.snapshot {
+		t.Fatalf("snapshot=0: got %v, %v", cfg.snapshot, err)
+	}
+	if _, err := parseSource("petkit://main?snapshot=perhaps"); err == nil {
+		t.Fatalf("bad snapshot should error")
+	}
+}
+
+func TestParseSourceForceIDR(t *testing.T) {
+	// Force-keyframe on connect is on by default.
+	if cfg, err := parseSource("petkit://main"); err != nil || !cfg.forceIDR {
+		t.Fatalf("default idr: got %v, %v", cfg.forceIDR, err)
+	}
+	if cfg, err := parseSource("petkit://main?idr=0"); err != nil || cfg.forceIDR {
+		t.Fatalf("idr=0: got %v, %v", cfg.forceIDR, err)
+	}
+	if _, err := parseSource("petkit://main?idr=nah"); err == nil {
+		t.Fatalf("bad idr should error")
+	}
+}
+
+func TestMsgRequestIDROverride(t *testing.T) {
+	if got := msgRequestIDR(); got != msgRequestIDRDefault {
+		t.Fatalf("default idr msg id: got 0x%x want 0x%x", got, msgRequestIDRDefault)
+	}
+	if msgRequestIDRDefault != 1 {
+		t.Fatalf("request_IDR default should be verified value 1, got %d", msgRequestIDRDefault)
+	}
+	t.Setenv("PETKIT_IDR_MSGID", "0x2a")
+	if got := msgRequestIDR(); got != 0x2a {
+		t.Fatalf("hex override: got 0x%x", got)
+	}
+	t.Setenv("PETKIT_IDR_MSGID", "junk")
+	if got := msgRequestIDR(); got != msgRequestIDRDefault {
+		t.Fatalf("bad override fallback: got 0x%x", got)
+	}
+}
+
+func TestParseSourceDebug(t *testing.T) {
+	// Off unless asked (env default is false in the test process).
+	if cfg, err := parseSource("petkit://main"); err != nil || cfg.debug {
+		t.Fatalf("default debug: got %v, %v", cfg.debug, err)
+	}
+	if cfg, err := parseSource("petkit://main?debug=1"); err != nil || !cfg.debug {
+		t.Fatalf("debug=1: got %v, %v", cfg.debug, err)
+	}
+	if _, err := parseSource("petkit://main?debug=yesno"); err == nil {
+		t.Fatalf("bad debug should error")
+	}
+}
+
+func TestMsgGetJpegPlane(t *testing.T) {
+	// Verified msg ids: main=4 -> snap_main.jpeg, sub=6 -> snap_sub.jpeg.
+	if got := msgGetJpeg("main"); got != msgGetJpegMain {
+		t.Fatalf("main msg id: got %d want %d", got, msgGetJpegMain)
+	}
+	if got := msgGetJpeg("sub"); got != msgGetJpegSub {
+		t.Fatalf("sub msg id: got %d want %d", got, msgGetJpegSub)
+	}
+	// Env override forces a specific id regardless of plane.
+	t.Setenv("PETKIT_JPEG_MSGID", "0x1f")
+	if got := msgGetJpeg("main"); got != 0x1f {
+		t.Fatalf("hex override: got 0x%x", got)
+	}
+	// A bad value falls back to the per-plane default rather than erroring.
+	t.Setenv("PETKIT_JPEG_MSGID", "notanumber")
+	if got := msgGetJpeg("sub"); got != msgGetJpegSub {
+		t.Fatalf("bad override fallback: got %d", got)
+	}
+}
+
 func TestParseSourceLayoutOverrides(t *testing.T) {
 	// A single field tweak on top of a named profile (hex).
 	cfg, err := parseSource("petkit://main?layout=t7&flags_off=0x1c")

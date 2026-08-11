@@ -61,6 +61,9 @@ type config struct {
 	talkback  bool        // advertise the browser-mic -> speaker backchannel
 	mediaType uint32      // filter mask + dispatch payload: 4/5/8/9
 	layout    frameLayout // per-firmware frame-descriptor layout
+	debug     bool        // verbose driver tracing for this source
+	snapshot  bool        // advertise a native JPEG track (device HW encoder)
+	forceIDR  bool        // request a hardware keyframe on connect + on resync
 }
 
 // parseSource decodes a petkit:// URL into the plane + audio selection and the
@@ -127,9 +130,37 @@ func parseSource(source string) (config, error) {
 		}
 	}
 
+	// Verbose driver tracing: ?debug=1 per stream, else the PETKIT_DEBUG env var.
+	debug := envDebug
+	if v := u.Query().Get("debug"); v != "" {
+		if debug, err = strconv.ParseBool(v); err != nil {
+			return config{}, fmt.Errorf("petkit: bad debug=%q: %w", v, err)
+		}
+	}
+
+	// Native JPEG snapshots via the camera's hardware encoder. On by default;
+	// ?snapshot=0 hides the JPEG track for devices/firmwares that lack the
+	// get_jpeg dispatch handler.
+	snapshot := true
+	if v := u.Query().Get("snapshot"); v != "" {
+		if snapshot, err = strconv.ParseBool(v); err != nil {
+			return config{}, fmt.Errorf("petkit: bad snapshot=%q: %w", v, err)
+		}
+	}
+
+	// Force a hardware keyframe on connect (and on resync). On by default;
+	// ?idr=0 disables it for firmwares that lack the request_IDR dispatch.
+	forceIDR := true
+	if v := u.Query().Get("idr"); v != "" {
+		if forceIDR, err = strconv.ParseBool(v); err != nil {
+			return config{}, fmt.Errorf("petkit: bad idr=%q: %w", v, err)
+		}
+	}
+
 	return config{
 		plane: plane, audio: audio, talkback: talkback,
-		mediaType: mediaType, layout: layout,
+		mediaType: mediaType, layout: layout, debug: debug,
+		snapshot: snapshot, forceIDR: forceIDR,
 	}, nil
 }
 
