@@ -138,10 +138,14 @@ func parseSource(source string) (config, error) {
 		}
 	}
 
-	// Native JPEG snapshots via the camera's hardware encoder. On by default;
-	// ?snapshot=0 hides the JPEG track for devices/firmwares that lack the
-	// get_jpeg dispatch handler.
-	snapshot := true
+	// Native JPEG snapshots via the camera's hardware get_jpeg dispatch. OFF by
+	// default: on at least the localkit D4SH2 firmware, get_jpeg
+	// (media_venc_get_jpeg_snap) reconfigures the LIVE IVPS group
+	// (AX_IVPS_SetPipelineAttr) to grab a frame, which starves the running
+	// encoders and trips media's watchdog reboot. The safe replacement is a
+	// pure-Go H.264 keyframe decoder (decode the IDR we already read from the
+	// ring). Opt in with ?snapshot=1 only on firmware known to tolerate it.
+	snapshot := false
 	if v := u.Query().Get("snapshot"); v != "" {
 		if snapshot, err = strconv.ParseBool(v); err != nil {
 			return config{}, fmt.Errorf("petkit: bad snapshot=%q: %w", v, err)

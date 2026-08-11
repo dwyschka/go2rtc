@@ -25,12 +25,20 @@ const (
 )
 
 // jpegTimeout bounds how long snapshotJPEG waits for the daemon to (re)write the
-// snapshot file after the trigger.
-const jpegTimeout = 2 * time.Second
+// snapshot file after the trigger. The camera's get_jpeg handler
+// (media_venc_get_jpeg_snap) enables an IVPS channel on demand and grabs one
+// frame with its OWN 2s AX_IVPS_GetChnFrame timeout, then JPEG-encodes and
+// writes the file — so the whole device-side operation can take just over 2s.
+// We must wait comfortably longer than that or we race it and serve the stale
+// (often blank) previous file.
+const jpegTimeout = 5 * time.Second
 
 // jpegRefresh is the cadence at which a live JPEG consumer (stream.mjpeg) gets a
-// fresh frame. A single frame.jpeg snapshot only ever reads the first one.
-const jpegRefresh = time.Second
+// fresh frame. Each snapshot toggles an IVPS channel on/off on the camera, so a
+// fast cadence thrashes the pipeline; a slow preview refresh is plenty and keeps
+// the snapshot path from fighting the live stream. A single frame.jpeg snapshot
+// only ever reads the first one.
+const jpegRefresh = 5 * time.Second
 
 // msgGetJpeg returns the get_jpeg dispatch id for a plane ("main"/"sub"),
 // honouring the PETKIT_JPEG_MSGID override (decimal or 0x-hex) for firmwares that

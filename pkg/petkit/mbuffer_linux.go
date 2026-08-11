@@ -350,10 +350,9 @@ func (mb *MBuffer) ActiveReaders() []string {
 	if mb.closed {
 		return []string{errClosed.Error()}
 	}
-	if err := mb.mu.Lock(lockTimeout); err != nil {
-		return []string{"lock: " + err.Error()}
-	}
-	defer mb.mu.Unlock()
+	// Lock-free: a diagnostic snapshot of the slot array. We never take the
+	// ring's process-shared mutex (see readOnce) — a slightly inconsistent slot
+	// listing is harmless, blocking media's writer is not.
 
 	var out []string
 	for i := 0; i < slotCount; i++ {
@@ -520,9 +519,24 @@ func (r *Reader) ReadFrame(timeoutMs int) (*Frame, error) {
 	}
 }
 
-// readOnce makes one scan pass over the ring. It is a direct port of libbase's
-// mbuffer_read_frame: take the shared lock, snap forward on ring loss, then
-// scan committed frames. Returns errAgain when no matching frame is committed.
+// readOnce makes one scan pass over the ring. It ports libbase's
+// mbuffer_read_frame but is deliberately LOCK-FREE: it never takes the ring's
+// process-shared mutex.
+//
+// Why: that mutex is also held by the camera's real-time writer
+// (mbuffer_write_frame, on media's VencGetStreamProc thread). If a Go goroutine
+// holds it and the Go runtime pauses it (GC, scheduler), media's writer blocks
+// on the same mutex, stops calling AX_VENC_ReleaseStream, the hardware encoder
+// backs up, and media's watchdog reboots on "IMP_Encoder_PollingStream timeout".
+// A polling reader taking that lock ~250x/s was starving the encoder.
+//
+// Instead we read the commit counters with atomic loads (the writer publishes a
+// frame by advancing write_num after its bytes are in place) and re-validate the
+// frame we copied against min_num afterwards, discarding as loss anything the
+// writer evicted out from under us. At the live edge a torn read is impossible
+// (the frame's bytes were committed before write_num moved and won't be
+// overwritten until the ring wraps a whole 8 MiB later); further back, the
+// min_num re-check catches eviction.
 func (r *Reader) readOnce() (*Frame, error) {
 	mb := r.mb
 	mb.access.RLock()
@@ -530,11 +544,6 @@ func (r *Reader) readOnce() (*Frame, error) {
 	if mb.closed {
 		return nil, errClosed
 	}
-
-	if err := mb.mu.Lock(lockTimeout); err != nil {
-		return nil, err
-	}
-	defer mb.mu.Unlock()
 
 	writeNum := mb.loadU32(offWriteNum)
 	minNum := mb.loadU32(offMinNum)
@@ -570,9 +579,21 @@ func (r *Reader) readOnce() (*Frame, error) {
 		}
 
 		if hdr.Flags&r.filter != 0 {
-			r.lastNum++
 			dataOff := (r.lastPos + hdrSz) & mb.ringMask
-			hdr.Data = mb.ringCopy(dataOff, size)
+			data := mb.ringCopy(dataOff, size)
+
+			// Re-validate after the copy: if the writer evicted past this frame
+			// while we were reading it (min_num moved beyond it), the bytes we
+			// copied may be torn — treat it as loss and resync next pass.
+			if int32(hdr.Num-mb.loadU32(offMinNum)) < 0 {
+				r.lastNum = mb.loadU32(offMinNum) - 1
+				r.lastPos = mb.loadU32(offTailPos) & mb.ringMask
+				r.lost = true
+				return nil, errAgain
+			}
+
+			r.lastNum++
+			hdr.Data = data
 			r.lastPos = (dataOff + size) & mb.ringMask
 			return &hdr, nil
 		}

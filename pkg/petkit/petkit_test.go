@@ -207,13 +207,14 @@ func TestParseSourceTalkback(t *testing.T) {
 }
 
 func TestParseSourceSnapshot(t *testing.T) {
-	// Native JPEG snapshots are advertised by default.
-	if cfg, err := parseSource("petkit://main"); err != nil || !cfg.snapshot {
+	// Native get_jpeg snapshots are OFF by default (they disrupt the live
+	// encoder on at least the localkit D4SH2 firmware).
+	if cfg, err := parseSource("petkit://main"); err != nil || cfg.snapshot {
 		t.Fatalf("default snapshot: got %v, %v", cfg.snapshot, err)
 	}
-	// ?snapshot=0 hides the JPEG track.
-	if cfg, err := parseSource("petkit://main?snapshot=0"); err != nil || cfg.snapshot {
-		t.Fatalf("snapshot=0: got %v, %v", cfg.snapshot, err)
+	// ?snapshot=1 opts in.
+	if cfg, err := parseSource("petkit://main?snapshot=1"); err != nil || !cfg.snapshot {
+		t.Fatalf("snapshot=1: got %v, %v", cfg.snapshot, err)
 	}
 	if _, err := parseSource("petkit://main?snapshot=perhaps"); err == nil {
 		t.Fatalf("bad snapshot should error")
