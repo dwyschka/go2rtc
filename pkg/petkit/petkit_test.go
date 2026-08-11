@@ -134,6 +134,8 @@ func TestSelectLayout(t *testing.T) {
 		"":        "arm", // default
 		"arm":     "arm",
 		"AXERA":   "arm",
+		"d4sh":    "arm",
+		"d4sh2":   "arm", // byte-identical descriptor (verified tserver_d4sh2)
 		"t7":      "t7",
 		"mips":    "t7",
 		"Ingenic": "t7",

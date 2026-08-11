@@ -53,6 +53,12 @@ type frameLayout struct {
 // historical default: every offset here matches agora's __on_audio_data writer
 // and tserver's reader on that SoC. A 64-bit capture timestamp sits at +0x18,
 // pushing the type/flags fields to +0x20/+0x22.
+//
+// The "d4sh2" firmware variant shares this descriptor byte-for-byte — verified
+// against tserver_d4sh2's mbuffer_read_frame (FUN_00014c00): it copies a 0x38
+// header, filters on the u16 type_flags at +0x22, reads num@0x00 / size@0x04,
+// and masks the ring offset with 0x7FFFFF (an 8 MiB ring) — all identical to
+// AXERA. So "d4sh2" is just an alias here, not a separate profile.
 var layoutARM = frameLayout{
 	name:    "arm",
 	hdrSize: 0x38,
@@ -127,7 +133,7 @@ var layoutW7H = frameLayout{
 // Aliases group firmwares by the SoC family whose descriptor they share.
 func selectLayout(name string) (frameLayout, error) {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "", "arm", "axera", "d4sh":
+	case "", "arm", "axera", "d4sh", "d4sh2":
 		return layoutARM, nil
 	case "t7", "mips", "mipsle", "ingenic", "d4":
 		return layoutT7, nil

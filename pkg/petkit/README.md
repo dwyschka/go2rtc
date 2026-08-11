@@ -112,7 +112,7 @@ there are worth confirming). `?debug=1` logs the trigger + byte count.
 
 | Profile | Aliases | Descriptor | Notes |
 | --- | --- | --- | --- |
-| `arm` | `axera`, `d4sh` | `0x38` bytes, type@`0x20` flags@`0x22` | Default. AXERA/ARM firmware. |
+| `arm` | `axera`, `d4sh`, `d4sh2` | `0x38` bytes, type@`0x20` flags@`0x22` | Default. AXERA/ARM firmware. `d4sh2` verified byte-identical (tserver_d4sh2). |
 | `t7` | `mips`, `ingenic`, `d4` | `0x35` bytes, type@`0x18` flags@`0x1A` | Ingenic-T7 (LE MIPS). Verified from `t7_libbase.so`. |
 | `w7h` | `w7`, `w7hc` | `0x3D` bytes, type@`0x20` flags@`0x22`, sps@`0x37` pps@`0x39` | ARM v8, 2 MiB ring, has speaker/talkback. Verified from `tserver_w7h`. Identical to `arm` through flags@`0x22`; SPS/PPS + total size are 5 bytes larger. |
 
