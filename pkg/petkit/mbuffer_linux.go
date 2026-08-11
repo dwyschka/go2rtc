@@ -565,16 +565,33 @@ func (r *Reader) readOnce() (*Frame, error) {
 		return nil, errAgain
 	}
 
+	// Consume only up to one frame BEHIND the live edge. The newest committed
+	// frame may still be settling on the writer's core: without taking the
+	// writer's mutex we get no acquire barrier pairing its payload writes with
+	// the write_num advance, so on a weakly-ordered core we could otherwise
+	// observe write_num move ahead of a frame's bytes and copy a torn AU — a
+	// corrupt keyframe that shows as an intermittent black screen over WebRTC.
+	// Requiring the writer to have committed a LATER frame before we read this
+	// one gives its bytes time to become globally visible. Costs ~one frame
+	// (~13 ms at 75 fps) of latency, which is imperceptible for live view.
+	readEdge := writeNum - 1
+
 	// Scan forward over committed frames.
 	hdrSz := uint32(mb.layout.hdrSize)
-	for int32(r.lastNum-writeNum) < 0 {
+	for int32(r.lastNum-readEdge) < 0 {
 		raw := mb.ringCopy(r.lastPos, hdrSz)
 		hdr := mb.layout.parseFrame(raw)
 		size := leU32(raw, mb.layout.offSize)
-		if size == 0 || size > mb.ringSize {
-			// Corrupt/desynced size: snap to the live edge and bail.
+
+		// The frame sequence number is monotonic across every media type. If the
+		// frame we landed on is not exactly the next one expected, our read
+		// cursor has desynced (a torn or short read moved lastPos wrong); a bad
+		// size means the same. Snap to the live edge and resync instead of
+		// emitting garbage — the running loop then waits for a fresh keyframe.
+		if hdr.Num != r.lastNum+1 || size == 0 || size > mb.ringSize {
 			r.lastNum = writeNum
 			r.lastPos = headPos
+			r.lost = true
 			return nil, errFrameSize
 		}
 
@@ -598,8 +615,8 @@ func (r *Reader) readOnce() (*Frame, error) {
 			return &hdr, nil
 		}
 
-		// Not our media type: skip the whole frame.
-		r.lastNum = hdr.Num
+		// Not our media type (e.g. the sub-stream plane): skip the whole frame.
+		r.lastNum++
 		r.lastPos = (r.lastPos + hdrSz + size) & mb.ringMask
 	}
 
