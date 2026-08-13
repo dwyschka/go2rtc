@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/aac"
@@ -52,6 +53,13 @@ const probeTimeout = 8 * time.Second
 // readTimeoutMs is the per-frame wait in the running loop.
 const readTimeoutMs = 5000
 
+// idrRetryInterval bounds how often we re-ask for a keyframe while needKey is
+// held. requestIDR is a fire-and-forget dispatch send (best-effort, no ack) —
+// if that one message is dropped, waiting silently for it would stall the
+// stream until the encoder's next natural GOP boundary, which can be a long
+// wait. So we keep asking on this interval until a keyframe actually arrives.
+const idrRetryInterval = 1 * time.Second
+
 // Producer reads the camera's shared-memory ring and feeds H.264 + AAC into
 // go2rtc. It replaces the device's tserver process.
 type Producer struct {
@@ -67,14 +75,14 @@ type Producer struct {
 
 	jpegStop chan struct{} // closed by Stop to end the JPEG pump goroutine
 
-	needKey bool // after a frame loss, drop video until the next keyframe
+	needKey        bool      // after a frame loss, drop video until the next keyframe
+	lastIDRRequest time.Time // last time requestIDR was (attempted to be) sent
 
-	// backchannel (talkback: browser mic -> camera speaker)
-	sender     *core.Sender
-	enc        *aacEncoder
-	pcmBuf     []int16 // 16 kHz mono accumulator until a 1024-sample AAC frame
-	prevSample int16   // last 8 kHz sample, for 2x upsampling
-	aacIdx     uint32  // frame_index for written audio frames
+	// backchannel (talkback: browser mic -> camera speaker). Each concurrent
+	// talker gets its own session (own PCM accumulator/encoder) instead of
+	// sharing one — see backchannel_linux.go for why.
+	talkbackMu       sync.Mutex
+	talkbackSessions map[*core.Receiver]*talkbackSession
 }
 
 // Dial opens the shared-memory ring, registers the "ts-server" reader, tells
@@ -148,12 +156,23 @@ func (p *Producer) requestIDR() {
 	if !p.cfg.forceIDR {
 		return
 	}
+	p.lastIDRRequest = time.Now()
 	var payload [4]byte
 	putU32(payload[:], 0, p.cfg.mediaType)
 	if err := dispatchSendFrom(dispatchIDRModule, msgRequestIDR(), dispatchSrcModule, payload[:]); err != nil {
 		p.cfg.dbg("request_IDR failed (best-effort): %v", err)
 	} else {
 		p.cfg.dbg("request_IDR sent (mediaType=0x%02x)", p.cfg.mediaType)
+	}
+}
+
+// retryIDRIfDue re-sends requestIDR on idrRetryInterval while a keyframe is
+// still pending. Called every pass through the running loop (cheap: one
+// time.Since check) so a single dropped request_IDR message self-heals
+// instead of stalling the stream indefinitely.
+func (p *Producer) retryIDRIfDue() {
+	if p.needKey && time.Since(p.lastIDRRequest) >= idrRetryInterval {
+		p.requestIDR()
 	}
 }
 
@@ -318,12 +337,11 @@ func (p *Producer) Start() (err error) {
 		if err != nil {
 			if errors.Is(err, errTimeout) || errors.Is(err, errFrameSize) {
 				// A desync/timeout means we may have skipped frames — the next
-				// video output must wait for a keyframe. Ask the encoder for one
-				// now (once per gap) so the freeze is as short as possible.
-				if !p.needKey {
-					p.requestIDR()
-				}
+				// video output must wait for a keyframe. Ask the encoder for one;
+				// retryIDRIfDue keeps re-asking every pass in case this message
+				// (or a later one) gets dropped.
 				p.needKey = true
+				p.retryIDRIfDue()
 				continue
 			}
 			if errors.Is(err, errClosed) {
@@ -333,14 +351,14 @@ func (p *Producer) Start() (err error) {
 		}
 
 		// If the ring lapped or underran, drop video until the next keyframe so
-		// the decoder never receives reference frames whose base is missing, and
-		// ask the encoder to emit one now (once per gap).
+		// the decoder never receives reference frames whose base is missing.
 		if p.reader.TakeLost() {
-			if !p.needKey {
-				p.requestIDR()
-			}
 			p.needKey = true
 		}
+		// Frames may keep flowing while we're still waiting on a keyframe (e.g.
+		// audio, or non-key video getting filtered in writeVideo below) — keep
+		// nudging the encoder on idrRetryInterval until one actually shows up.
+		p.retryIDRIfDue()
 
 		p.Recv += len(f.Data)
 
@@ -407,8 +425,10 @@ func (p *Producer) Stop() error {
 		close(p.jpegStop)
 		p.jpegStop = nil
 	}
-	if p.sender != nil {
-		p.sender.Close()
+	if len(p.Senders) > 0 {
+		for _, s := range p.Senders {
+			s.Close()
+		}
 		// End-of-stream marker + tell module 1 to stop its speaker reader.
 		_ = p.mb.WriteAudioFrame(nil, uint64(time.Now().UnixNano()/1000), 0)
 		stopTalkback()
