@@ -13,18 +13,11 @@ import (
 // "/msg_dispatch_<module>". Messages are little-endian: [0:2] msg_id, [2:4] src
 // module (we are not registered -> 0), [4:] payload.
 const (
-	dispatchDstModule uint16 = 1 // camera media manager (video)
-	dispatchMsgID     uint16 = 1 // "set frame type" message id
 	dispatchSrcModule uint16 = 0 // we never register a src id -> 0
 
 	mqMaxMsg  = 128 // mq_attr.mq_maxmsg
 	mqMsgSize = 544 // mq_attr.mq_msgsize (0x220)
 )
-
-// dispatchSend sends one control message to "/msg_dispatch_<dst>" with src 0.
-func dispatchSend(dst, msgID uint16, payload []byte) error {
-	return dispatchSendFrom(dst, msgID, dispatchSrcModule, payload)
-}
 
 // dispatchSendFrom sends a control message with an explicit src module id.
 func dispatchSendFrom(dst, msgID, src uint16, payload []byte) error {
@@ -44,12 +37,6 @@ func dispatchSendFrom(dst, msgID, src uint16, payload []byte) error {
 	return mqSend(mqd, msg)
 }
 
-// sendMediaType tells the camera pipeline which plane/audio to produce.
-func sendMediaType(dst, msgID, src uint16, mediaType uint32) error {
-	var payload [4]byte
-	binary.LittleEndian.PutUint32(payload[:], mediaType)
-	return dispatchSend(dst, msgID, payload[:])
-}
 
 // The media/audio daemon (DISPATCH_RECEIVER_MEDIA, module 2) talkback verbs.
 // Talkback control (verified from agora_arm on the actual ARM/AXERA device):

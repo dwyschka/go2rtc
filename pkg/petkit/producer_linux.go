@@ -63,6 +63,9 @@ type Producer struct {
 
 	video *core.Receiver
 	audio *core.Receiver
+	jpeg  *core.Receiver // native hardware JPEG snapshots (frame.jpeg/stream.mjpeg)
+
+	jpegStop chan struct{} // closed by Stop to end the JPEG pump goroutine
 
 	needKey bool // after a frame loss, drop video until the next keyframe
 
@@ -83,10 +86,17 @@ func Dial(source string) (core.Producer, error) {
 		return nil, err
 	}
 
-	mb, err := OpenMBuffer()
+	cfg.dbg("dial %q -> plane=%s audio=%v talkback=%v mediaType=0x%02x layout=%s",
+		source, cfg.plane, cfg.audio, cfg.talkback, cfg.mediaType, cfg.layout.name)
+
+	mb, err := OpenMBuffer(cfg.layout)
 	if err != nil {
+		cfg.dbg("OpenMBuffer failed: %v", err)
 		return nil, err
 	}
+	cfg.dbg("mapped %s ring=%d bytes hdr=%#x offsets{num=%#x size=%#x type=%#x flags=%#x sps=%#x}",
+		shmPath, mb.ringSize, cfg.layout.hdrSize, cfg.layout.offNum, cfg.layout.offSize,
+		cfg.layout.offType, cfg.layout.offFlags, cfg.layout.offSPS)
 
 	reader, err := mb.CreateReader(readerName, true)
 	if err != nil {
@@ -99,12 +109,7 @@ func Dial(source string) (core.Producer, error) {
 		return nil, err
 	}
 
-	// Ask the camera pipeline to start producing the requested plane/audio.
-	// Best-effort: if the camera is already producing this plane (e.g. another
-	// client is active) frames flow without it, so a dispatch failure must not
-	// block streaming. Any error is surfaced only if probing then finds no
-	// frames.
-	dispatchErr := sendMediaType(dispatchDstModule, dispatchMsgID, dispatchSrcModule, cfg.mediaType)
+	cfg.dbg("ring writeNum=%d readers=%v", mb.WriteNum(), mb.ActiveReaders())
 
 	prod := &Producer{
 		Connection: core.Connection{
@@ -120,16 +125,36 @@ func Dial(source string) (core.Producer, error) {
 		cfg:    cfg,
 	}
 
+	// Force an immediate keyframe (request_IDR, msg 1) so probing — and any
+	// joining client — gets an SPS+IDR at once instead of waiting out the
+	// encoder's natural GOP, the common cause of a connect-time freeze. This is
+	// the dispatch the driver historically sent as the misnamed "start plane";
+	// the camera produces the plane regardless, so it only ever forced a keyframe.
+	prod.requestIDR()
+
 	if err = prod.probe(); err != nil {
 		_ = prod.Stop()
-		if dispatchErr != nil {
-			return nil, fmt.Errorf("%w (dispatch to %s also failed: %v)",
-				err, "/msg_dispatch_1", dispatchErr)
-		}
 		return nil, err
 	}
 
 	return prod, nil
+}
+
+// requestIDR asks the hardware encoder to emit an immediate keyframe via the
+// media daemon's request_IDR dispatch (msg 1). The payload is the plane bitmask
+// (cfg.mediaType: bit2=main/chn0, bit3=sub/chn1) — the handler rejects an empty
+// one. Best-effort: a wrong msg_id just means we fall back to the natural GOP.
+func (p *Producer) requestIDR() {
+	if !p.cfg.forceIDR {
+		return
+	}
+	var payload [4]byte
+	putU32(payload[:], 0, p.cfg.mediaType)
+	if err := dispatchSendFrom(dispatchIDRModule, msgRequestIDR(), dispatchSrcModule, payload[:]); err != nil {
+		p.cfg.dbg("request_IDR failed (best-effort): %v", err)
+	} else {
+		p.cfg.dbg("request_IDR sent (mediaType=0x%02x)", p.cfg.mediaType)
+	}
 }
 
 // probe reads frames until it has built the video codec (from the first frame
@@ -149,6 +174,11 @@ func (p *Producer) probe() (err error) {
 	var videoCodec, audioCodec *core.Codec
 	needAudio := p.cfg.audio
 
+	// Probe-time frame census, surfaced on failure so the operator can tell
+	// "camera producing nothing" (all zero) from "wrong layout" (frames arrive
+	// but never classify as SPS-carrying video).
+	var nFrames, nAudio, nVideo, nSPS int
+
 	for videoCodec == nil || (needAudio && audioCodec == nil) {
 		if time.Now().After(deadline) {
 			break
@@ -157,17 +187,24 @@ func (p *Producer) probe() (err error) {
 		f, err := p.reader.ReadFrame(500)
 		if err != nil {
 			if errors.Is(err, errTimeout) || errors.Is(err, errFrameSize) {
+				p.cfg.dbg("probe read: %v (writeNum=%d)", err, p.mb.WriteNum())
 				continue
 			}
 			return err
 		}
 
+		nFrames++
+		p.cfg.dbg("frame num=%d flags=0x%04x type=%d size=%d isAudio=%v",
+			f.Num, f.Flags, f.Type, len(f.Data), f.Flags&mediaAudio != 0)
+
 		if f.Flags&mediaAudio != 0 {
 			// Audio frame.
+			nAudio++
 			if needAudio && audioCodec == nil && len(f.Data) >= aac.ADTSHeaderSize {
 				if c := aac.ADTSToCodec(f.Data); c != nil {
 					c.PayloadType = core.PayloadTypeRAW
 					audioCodec = c
+					p.cfg.dbg("audio codec: %s %dHz", c.Name, c.ClockRate)
 				}
 			}
 			continue
@@ -176,17 +213,24 @@ func (p *Producer) probe() (err error) {
 		// Video frame — build the codec from any AU that carries an SPS. We do
 		// not rely on the frame header's keyframe flag (its offset is not
 		// verified across firmware variants); the AU bytes are authoritative.
+		nVideo++
 		if videoCodec == nil {
-			if avcc := annexb.EncodeToAVCC(f.Data); containsSPS(avcc) {
+			avcc := annexb.EncodeToAVCC(f.Data)
+			if containsSPS(avcc) {
+				nSPS++
 				videoCodec = h264.AVCCToCodec(avcc)
+				p.cfg.dbg("video codec built from SPS at num=%d", f.Num)
 			}
 		}
 	}
 
 	if videoCodec == nil {
+		p.cfg.dbg("probe FAILED: frames=%d audio=%d video=%d sps=%d writeNum=%d readers=%v",
+			nFrames, nAudio, nVideo, nSPS, p.mb.WriteNum(), p.mb.ActiveReaders())
 		return errors.New("petkit: no video keyframe seen while probing " +
 			"(camera not producing this plane, or frame layout differs from the spec)")
 	}
+	p.cfg.dbg("probe OK: frames=%d audio=%d video=%d", nFrames, nAudio, nVideo)
 
 	p.Medias = append(p.Medias, &core.Media{
 		Kind:      core.KindVideo,
@@ -201,16 +245,34 @@ func (p *Producer) probe() (err error) {
 		})
 	}
 
+	// Native JPEG snapshots via the device's hardware encoder (see
+	// snapshot_linux.go). Advertising a JPEG video track lets go2rtc's
+	// frame.jpeg / stream.mjpeg serve it directly — the keyframe consumer
+	// prefers JPEG over H.264, so no ffmpeg transcode is needed. The HW encoder
+	// only runs while a JPEG consumer is attached, so this is free otherwise.
+	if p.cfg.snapshot {
+		p.Medias = append(p.Medias, &core.Media{
+			Kind:      core.KindVideo,
+			Direction: core.DirectionRecvonly,
+			Codecs: []*core.Codec{
+				{Name: core.CodecJPEG, ClockRate: 90000},
+			},
+		})
+	}
+
 	// Talkback backchannel: advertise that we accept G.711 A-law audio to play
 	// on the camera speaker. Browsers negotiate PCMA directly over WebRTC, which
-	// avoids needing an Opus decoder on the device.
-	p.Medias = append(p.Medias, &core.Media{
-		Kind:      core.KindAudio,
-		Direction: core.DirectionSendonly,
-		Codecs: []*core.Codec{
-			{Name: core.CodecPCMA, ClockRate: 8000, PayloadType: 8},
-		},
-	})
+	// avoids needing an Opus decoder on the device. Skipped when the device has
+	// no speaker (e.g. the mic-only Ingenic-T7) so no dead talk button appears.
+	if p.cfg.talkback {
+		p.Medias = append(p.Medias, &core.Media{
+			Kind:      core.KindAudio,
+			Direction: core.DirectionSendonly,
+			Codecs: []*core.Codec{
+				{Name: core.CodecPCMA, ClockRate: 8000, PayloadType: 8},
+			},
+		})
+	}
 
 	return nil
 }
@@ -225,14 +287,30 @@ func (p *Producer) Start() (err error) {
 		}
 	}()
 
-	// Map the receivers requested by downstream consumers to video/audio.
+	// Map the receivers requested by downstream consumers. JPEG and H.264 are
+	// both KindVideo, so switch on the codec name, not the kind.
 	for _, recv := range p.Receivers {
-		switch recv.Codec.Kind() {
-		case core.KindVideo:
+		switch {
+		case recv.Codec.Name == core.CodecJPEG:
+			p.jpeg = recv
+		case recv.Codec.Kind() == core.KindVideo:
 			p.video = recv
-		case core.KindAudio:
+		case recv.Codec.Kind() == core.KindAudio:
 			p.audio = recv
 		}
+	}
+
+	// Native JPEG snapshots are produced out-of-band from the ring (the device's
+	// hardware encoder writes them to a file). Drive that separately.
+	if p.jpeg != nil {
+		p.jpegStop = make(chan struct{})
+		if p.video == nil && p.audio == nil {
+			// Snapshot-only consumer (e.g. frame.jpeg): don't spin the ring pump
+			// at all — just serve JPEG until Stop unblocks us.
+			p.pumpJPEG()
+			return nil
+		}
+		go p.pumpJPEG()
 	}
 
 	for {
@@ -240,7 +318,11 @@ func (p *Producer) Start() (err error) {
 		if err != nil {
 			if errors.Is(err, errTimeout) || errors.Is(err, errFrameSize) {
 				// A desync/timeout means we may have skipped frames — the next
-				// video output must wait for a keyframe.
+				// video output must wait for a keyframe. Ask the encoder for one
+				// now (once per gap) so the freeze is as short as possible.
+				if !p.needKey {
+					p.requestIDR()
+				}
 				p.needKey = true
 				continue
 			}
@@ -251,8 +333,12 @@ func (p *Producer) Start() (err error) {
 		}
 
 		// If the ring lapped or underran, drop video until the next keyframe so
-		// the decoder never receives reference frames whose base is missing.
+		// the decoder never receives reference frames whose base is missing, and
+		// ask the encoder to emit one now (once per gap).
 		if p.reader.TakeLost() {
+			if !p.needKey {
+				p.requestIDR()
+			}
 			p.needKey = true
 		}
 
@@ -317,6 +403,10 @@ func (p *Producer) writeAudio(f *Frame) {
 // teardown must run BEFORE Connection.Stop: that closes the Transport (our
 // MBuffer), and the EOS frame + reader-slot release need the live mapping.
 func (p *Producer) Stop() error {
+	if p.jpegStop != nil {
+		close(p.jpegStop)
+		p.jpegStop = nil
+	}
 	if p.sender != nil {
 		p.sender.Close()
 		// End-of-stream marker + tell module 1 to stop its speaker reader.

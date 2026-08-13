@@ -57,7 +57,15 @@
         video.background = background;
         video.mode = modes[i] || video.mode;
         video.style.flex = width;
-        video.src = new URL('api/ws?src=' + encodeURIComponent(streams[i]), location.href);
+        const src = new URL('api/ws?src=' + encodeURIComponent(streams[i]), location.href);
+        // Forward metadata-transform params (no re-encode) to the MSE/MP4
+        // consumer. rotate/scale patch the fMP4 track matrix and only apply in
+        // MSE/MP4 mode, so pair with mode=mse (WebRTC ignores them).
+        for (const key of ['rotate', 'scale']) {
+            const val = params.get(key);
+            if (val !== null) src.searchParams.set(key, val);
+        }
+        video.src = src;
         document.body.appendChild(video);
     }
 

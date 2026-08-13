@@ -2,6 +2,7 @@ package mp4
 
 import (
 	"errors"
+	"strings"
 
 	"github.com/AlexxIT/go2rtc/internal/api"
 	"github.com/AlexxIT/go2rtc/internal/api/ws"
@@ -29,6 +30,22 @@ func handlerWSMSE(tr *ws.Transport, msg *ws.Message) error {
 	if err := stream.AddConsumer(cons); err != nil {
 		log.Debug().Err(err).Msg("[mp4] add consumer")
 		return err
+	}
+
+	// Metadata rotation/scale via the fMP4 track matrix (no re-encode), so a
+	// stream whose source can't rotate (e.g. the Ingenic-T7 Petkit reading
+	// already-encoded H.264) can still be shown upright. Must be set before
+	// WriteTo generates the init segment. Matches the /api/stream.mp4 handler;
+	// honored by Chrome/Firefox MSE (not Safari).
+	query := tr.Request.URL.Query()
+	if rotate := query.Get("rotate"); rotate != "" {
+		cons.Rotate = core.Atoi(rotate)
+	}
+	if scale := query.Get("scale"); scale != "" {
+		if sx, sy, ok := strings.Cut(scale, ":"); ok {
+			cons.ScaleX = core.Atoi(sx)
+			cons.ScaleY = core.Atoi(sy)
+		}
 	}
 
 	tr.Write(&ws.Message{Type: "mse", Value: mp4.ContentType(cons.Codecs())})

@@ -12,15 +12,19 @@
 //
 //   - Ring buffer:  POSIX shm object "/media_buffer_frame_buf".
 //     Layout: a 0x3E8 (1000-byte) control block followed by a power-of-two
-//     ring (4 MiB on MIPS, 8 MiB on ARM). Size is discovered via fstat, so the
-//     same code works on both builds.
+//     ring (2 MiB on Ingenic-T7/MIPS, 8 MiB on ARM/AXERA). Size is discovered
+//     via fstat, so the same code works on both builds. The control block and
+//     reader-slot layout are byte-for-byte identical across firmwares.
 //   - Reader:       a consumer registers a 0x2C-byte slot (name "ts-server")
 //     in the control block and receives only frames whose type bits match its
 //     filter mask.
 //   - Dispatch:     on start, a message is sent to POSIX mqueue
 //     "/msg_dispatch_1" telling the camera pipeline which plane/audio to emit.
-//   - Frames:       video is H.264 Annex-B, audio is AAC in ADTS. Presentation
-//     timestamps are 64-bit microseconds in the frame header.
+//   - Frames:       video is H.264 Annex-B, audio is AAC in ADTS. The per-frame
+//     descriptor differs by SoC family (see frameLayout / layout.go): the ARM
+//     build uses a 0x38-byte descriptor with type/flags at +0x20/+0x22, the
+//     Ingenic-T7 build a 0x35-byte descriptor with them at +0x18/+0x1A. Select
+//     with ?layout=arm|t7 or the PETKIT_LAYOUT env var (default arm).
 //
 // URL format:
 //
@@ -37,7 +41,9 @@ package petkit
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -52,7 +58,12 @@ const (
 type config struct {
 	plane     string // "main" or "sub"
 	audio     bool
-	mediaType uint32 // filter mask + dispatch payload: 4/5/8/9
+	talkback  bool        // advertise the browser-mic -> speaker backchannel
+	mediaType uint32      // filter mask + dispatch payload: 4/5/8/9
+	layout    frameLayout // per-firmware frame-descriptor layout
+	debug     bool        // verbose driver tracing for this source
+	snapshot  bool        // advertise a native JPEG track (device HW encoder)
+	forceIDR  bool        // request a hardware keyframe on connect + on resync
 }
 
 // parseSource decodes a petkit:// URL into the plane + audio selection and the
@@ -100,7 +111,61 @@ func parseSource(source string) (config, error) {
 		mediaType |= mediaAudio
 	}
 
-	return config{plane: plane, audio: audio, mediaType: mediaType}, nil
+	// The frame-descriptor layout differs by camera SoC family. Select it per
+	// source via ?layout=arm|t7 (falling back to the PETKIT_LAYOUT env var and
+	// then the ARM default), with optional per-field offset overrides in the
+	// query for devices that match neither built-in profile.
+	layout, err := layoutFromQuery(u.Query())
+	if err != nil {
+		return config{}, err
+	}
+
+	// Talkback (browser mic -> camera speaker) defaults to whether the device
+	// has a speaker at all; ?talkback=0|1 overrides. A mic-only device (T7) thus
+	// advertises no dead backchannel.
+	talkback := layout.speaker
+	if v := u.Query().Get("talkback"); v != "" {
+		if talkback, err = strconv.ParseBool(v); err != nil {
+			return config{}, fmt.Errorf("petkit: bad talkback=%q: %w", v, err)
+		}
+	}
+
+	// Verbose driver tracing: ?debug=1 per stream, else the PETKIT_DEBUG env var.
+	debug := envDebug
+	if v := u.Query().Get("debug"); v != "" {
+		if debug, err = strconv.ParseBool(v); err != nil {
+			return config{}, fmt.Errorf("petkit: bad debug=%q: %w", v, err)
+		}
+	}
+
+	// Native JPEG snapshots via the camera's hardware get_jpeg dispatch. OFF by
+	// default: on at least the localkit D4SH2 firmware, get_jpeg
+	// (media_venc_get_jpeg_snap) reconfigures the LIVE IVPS group
+	// (AX_IVPS_SetPipelineAttr) to grab a frame, which starves the running
+	// encoders and trips media's watchdog reboot. The safe replacement is a
+	// pure-Go H.264 keyframe decoder (decode the IDR we already read from the
+	// ring). Opt in with ?snapshot=1 only on firmware known to tolerate it.
+	snapshot := false
+	if v := u.Query().Get("snapshot"); v != "" {
+		if snapshot, err = strconv.ParseBool(v); err != nil {
+			return config{}, fmt.Errorf("petkit: bad snapshot=%q: %w", v, err)
+		}
+	}
+
+	// Force a hardware keyframe on connect (and on resync). On by default;
+	// ?idr=0 disables it for firmwares that lack the request_IDR dispatch.
+	forceIDR := true
+	if v := u.Query().Get("idr"); v != "" {
+		if forceIDR, err = strconv.ParseBool(v); err != nil {
+			return config{}, fmt.Errorf("petkit: bad idr=%q: %w", v, err)
+		}
+	}
+
+	return config{
+		plane: plane, audio: audio, talkback: talkback,
+		mediaType: mediaType, layout: layout, debug: debug,
+		snapshot: snapshot, forceIDR: forceIDR,
+	}, nil
 }
 
 // Frame is one media unit copied out of the ring buffer.
@@ -115,18 +180,68 @@ type Frame struct {
 	Data  []byte // payload (Annex-B H.264 or ADTS AAC)
 }
 
-// parseFrameHeader decodes the 0x38-byte frame header at the front of a ring
-// slot. Field offsets are fixed across the MIPS and ARM builds.
-func parseFrameHeader(h []byte) Frame {
-	return Frame{
-		Num:   binary.LittleEndian.Uint32(h[0x00:]),
-		Index: binary.LittleEndian.Uint32(h[0x08:]),
-		PTS:   binary.LittleEndian.Uint64(h[0x10:]),
-		Type:  h[0x20],
-		Flags: binary.LittleEndian.Uint16(h[0x22:]),
-		SPS:   binary.LittleEndian.Uint16(h[0x32:]),
-		PPS:   binary.LittleEndian.Uint16(h[0x34:]),
+// Little-endian field readers that treat a negative offset (a field absent in
+// this firmware's descriptor) or an out-of-range offset as zero, so a shorter
+// descriptor layout can never index past the copied header bytes.
+
+func leByte(h []byte, off int) uint8 {
+	if off < 0 || off >= len(h) {
+		return 0
 	}
+	return h[off]
+}
+
+func leU16(h []byte, off int) uint16 {
+	if off < 0 || off+2 > len(h) {
+		return 0
+	}
+	return binary.LittleEndian.Uint16(h[off:])
+}
+
+func leU32(h []byte, off int) uint32 {
+	if off < 0 || off+4 > len(h) {
+		return 0
+	}
+	return binary.LittleEndian.Uint32(h[off:])
+}
+
+func leU64(h []byte, off int) uint64 {
+	if off < 0 || off+8 > len(h) {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(h[off:])
+}
+
+// Matching writers. A negative offset (field absent in this firmware's
+// descriptor) or an out-of-range offset is a no-op, so the write path never
+// touches bytes outside the descriptor it allocated.
+
+func putByte(h []byte, off int, v uint8) {
+	if off < 0 || off >= len(h) {
+		return
+	}
+	h[off] = v
+}
+
+func putU16(h []byte, off int, v uint16) {
+	if off < 0 || off+2 > len(h) {
+		return
+	}
+	binary.LittleEndian.PutUint16(h[off:], v)
+}
+
+func putU32(h []byte, off int, v uint32) {
+	if off < 0 || off+4 > len(h) {
+		return
+	}
+	binary.LittleEndian.PutUint32(h[off:], v)
+}
+
+func putU64(h []byte, off int, v uint64) {
+	if off < 0 || off+8 > len(h) {
+		return
+	}
+	binary.LittleEndian.PutUint64(h[off:], v)
 }
 
 // ringRead copies n bytes out of a power-of-two ring starting at byte offset
