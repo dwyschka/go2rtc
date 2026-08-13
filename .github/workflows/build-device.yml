@@ -27,14 +27,10 @@ jobs:
         with: { go-version: '1.24' }
 
       # scripts/build-device.sh pins its own GOTOOLCHAIN (go1.24.13) and
-      # UPX-compresses the mipsle binary via a pinned upx-ucl 4.2.x Docker
-      # image (built automatically, no host upx needed). The armhf binary is
-      # left uncompressed by default — the older AXERA/D4SH kernel segfaults
-      # on the UPX stub; set UPX_ARM: '1' below if your unit is the newer w7h
-      # (ARM v8), which handles it fine.
+      # UPX-compresses both binaries via a pinned upx-ucl 4.2.x Docker image
+      # (built automatically, no host upx needed).
       - name: Build armhf + mipsle
         run: scripts/build-device.sh all
-        # env: { UPX_ARM: '1' }
 
       - name: Show artifacts
         run: ls -lh dist/
