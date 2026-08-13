@@ -1,0 +1,51 @@
+name: Build device binaries
+
+on:
+  push:
+    branches:
+      - 'master'
+
+permissions:
+  contents: write
+
+# Reusing the same "latest" tag below means concurrent runs would race each
+# other updating the same release — serialize instead of running in parallel.
+concurrency:
+  group: build-device-latest
+  cancel-in-progress: true
+
+jobs:
+  build-device:
+    name: Build petkit device binaries
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with: { go-version: '1.24' }
+
+      # scripts/build-device.sh pins its own GOTOOLCHAIN (go1.24.13) and
+      # UPX-compresses the mipsle binary via a pinned upx-ucl 4.2.x Docker
+      # image (built automatically, no host upx needed). The armhf binary is
+      # left uncompressed by default — the older AXERA/D4SH kernel segfaults
+      # on the UPX stub; set UPX_ARM: '1' below if your unit is the newer w7h
+      # (ARM v8), which handles it fine.
+      - name: Build armhf + mipsle
+        run: scripts/build-device.sh all
+        # env: { UPX_ARM: '1' }
+
+      - name: Show artifacts
+        run: ls -lh dist/
+
+      - name: Publish rolling "latest" release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest master build
+          make_latest: true
+          body: |
+            Automatischer Build von ${{ github.sha }} (${{ github.event.head_commit.timestamp }}).
+            Wird bei jedem Push nach `master` überschrieben.
+          files: dist/go2rtc-petkit-*
